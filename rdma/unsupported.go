@@ -2,6 +2,6 @@
 
 package rdma
 
-func open(opts Options) (DataPlane, error) {
+func open(opts Options) (RdmaDevice, error) {
 	return nil, ErrUnsupported
 }

@@ -9,25 +9,25 @@ import (
 
 var ErrUnsupported = errors.New("rdma: unsupported; rebuild on Linux with -tags rdma and libibverbs")
 
-type Endpoint = protocol.RDMAEndpoint
+type Addr = protocol.RDMAEndpoint
 type MemoryRegion = protocol.RDMAMemoryRegion
 
-type RemoteBuffer interface {
+type RdmaDevice interface {
+	Info() Addr
+	Connect(ctx context.Context, remote Addr) (Conn, error)
+	Close() error
+}
+
+type RdmaBuffer interface {
 	Bytes() []byte
 	Region() MemoryRegion
 	Close() error
 }
 
 type Conn interface {
-	LocalEndpoint() Endpoint
-	Connect(ctx context.Context, remote Endpoint) error
-	RegisterRemoteBuffer(size int) (RemoteBuffer, error)
-	Read(ctx context.Context, dst []byte, remote MemoryRegion) error
-	Close() error
-}
-
-type DataPlane interface {
-	NewConn(ctx context.Context) (Conn, error)
+	LocalEndpoint() Addr
+	RegisterRdmaBuffer(size int) (RdmaBuffer, error)
+	Read(ctx context.Context, dst RdmaBuffer, remote MemoryRegion) error
 	Close() error
 }
 
@@ -37,6 +37,6 @@ type Options struct {
 	GIDIndex int
 }
 
-func Open(opts Options) (DataPlane, error) {
+func Open(opts Options) (RdmaDevice, error) {
 	return open(opts)
 }

@@ -15,7 +15,7 @@ type Config struct {
 	Addr         string
 	ChunkSize    uint64
 	ChunkBuffers int
-	DataPlane    rdma.DataPlane
+	RdmaDevice   rdma.RdmaDevice
 }
 
 type server struct {
@@ -25,8 +25,8 @@ type server struct {
 }
 
 func newServer(cfg Config) (*server, error) {
-	if cfg.DataPlane == nil {
-		return nil, errors.New("server: data plane is required")
+	if cfg.RdmaDevice == nil {
+		return nil, errors.New("server: RDMA device is required")
 	}
 	chunkSize := cfg.ChunkSize
 	if chunkSize == 0 {
@@ -93,11 +93,11 @@ func (s *server) run(ctx context.Context) error {
 	return <-errc
 }
 
-func ServeOne(ctx context.Context, listener net.Listener, dp rdma.DataPlane, chunkSize uint64) error {
+func ServeOne(ctx context.Context, listener net.Listener, device rdma.RdmaDevice, chunkSize uint64) error {
 	srv, err := newServer(Config{
-		Addr:      listener.Addr().String(),
-		ChunkSize: chunkSize,
-		DataPlane: dp,
+		Addr:       listener.Addr().String(),
+		ChunkSize:  chunkSize,
+		RdmaDevice: device,
 	})
 	if err != nil {
 		return err
@@ -115,7 +115,7 @@ func (s *server) serveOne(ctx context.Context, listener net.Listener) error {
 }
 
 func (s *server) serveConn(ctx context.Context, conn net.Conn) error {
-	session := NewSession(conn, s.cfg.DataPlane, s.chunkSize, s.chunkBuffers)
+	session := NewSession(conn, s.cfg.RdmaDevice, s.chunkSize, s.chunkBuffers)
 	return session.Run(ctx)
 }
 

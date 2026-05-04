@@ -16,7 +16,7 @@ import (
 
 type RgetSession struct {
 	ctrl         net.Conn
-	dp           rdma.DataPlane
+	device       rdma.RdmaDevice
 	dpConn       rdma.Conn
 	file         *os.File
 	request      *protocol.NewSessionFrame
@@ -29,14 +29,14 @@ type RgetSession struct {
 type chunkBuffer struct {
 	index   uint64
 	data    []byte
-	remote  rdma.RemoteBuffer
+	remote  rdma.RdmaBuffer
 	chunkID uint64
 	offset  uint64
 	size    uint64
 	final   bool
 }
 
-func NewSession(ctrl net.Conn, dp rdma.DataPlane, chunkSize uint64, chunkBuffers int) *RgetSession {
+func NewSession(ctrl net.Conn, device rdma.RdmaDevice, chunkSize uint64, chunkBuffers int) *RgetSession {
 	if chunkSize == 0 {
 		chunkSize = transfer.DefaultChunkSize
 	}
@@ -45,7 +45,7 @@ func NewSession(ctrl net.Conn, dp rdma.DataPlane, chunkSize uint64, chunkBuffers
 	}
 	return &RgetSession{
 		ctrl:         ctrl,
-		dp:           dp,
+		device:       device,
 		chunkSize:    chunkSize,
 		chunkBuffers: makeChunkBuffers(chunkBuffers),
 		inflight:     make(map[uint64]*chunkBuffer),
@@ -149,23 +149,18 @@ func (s *RgetSession) openFile() error {
 }
 
 func (s *RgetSession) openRDMAConn(ctx context.Context) error {
-	dpConn, err := s.dp.NewConn(ctx)
+	dpConn, err := s.device.Connect(ctx, s.request.ClientEndpoint)
 	if err != nil {
-		_ = s.sendError("rdma_failed", err.Error())
-		return err
-	}
-	s.dpConn = dpConn
-
-	if err := s.dpConn.Connect(ctx, s.request.ClientEndpoint); err != nil {
 		_ = s.sendError("rdma_connect_failed", err.Error())
 		return err
 	}
+	s.dpConn = dpConn
 	return nil
 }
 
 func (s *RgetSession) registerChunkBuffers() error {
 	for i := range s.chunkBuffers {
-		remote, err := s.dpConn.RegisterRemoteBuffer(int(s.chunkSize))
+		remote, err := s.dpConn.RegisterRdmaBuffer(int(s.chunkSize))
 		if err != nil {
 			_ = s.sendError("rdma_register_failed", err.Error())
 			return err
@@ -273,7 +268,7 @@ func (s *RgetSession) eof() bool {
 	return err == nil && uint64(offset) >= s.totalSize
 }
 
-func (b *chunkBuffer) readyFrame(endpoint rdma.Endpoint) *protocol.ChunkBufferReadyFrame {
+func (b *chunkBuffer) readyFrame(endpoint rdma.Addr) *protocol.ChunkBufferReadyFrame {
 	region := b.remote.Region()
 	region.Length = b.size
 	return &protocol.ChunkBufferReadyFrame{
@@ -305,7 +300,7 @@ func (b *chunkBuffer) Close() error {
 	return err
 }
 
-func emptyChunkReady(endpoint rdma.Endpoint) *protocol.ChunkBufferReadyFrame {
+func emptyChunkReady(endpoint rdma.Addr) *protocol.ChunkBufferReadyFrame {
 	return &protocol.ChunkBufferReadyFrame{
 		BufferIndex:    0,
 		ChunkID:        0,

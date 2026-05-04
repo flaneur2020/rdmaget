@@ -15,6 +15,8 @@ import (
 	"github.com/flaneur2020/rget/transfer"
 )
 
+var openRdmaDevice = rdma.Open
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -51,28 +53,28 @@ func runServe(ctx context.Context, args []string) error {
 	addr := fs.String("listen", ":7471", "TCP control-plane listen address")
 	chunkSize := fs.Uint64("chunk-size", transfer.DefaultChunkSize, "chunk buffer size in bytes")
 	chunkBuffers := fs.Int("chunk-buffers", transfer.DefaultChunkBuffers, "number of registered chunk buffers per session")
-	device := fs.String("rdma-device", "", "RDMA verbs device name, empty selects the first device")
+	deviceName := fs.String("rdma-device", "", "RDMA verbs device name, empty selects the first device")
 	port := fs.Uint("rdma-port", 1, "RDMA port number")
 	gidIndex := fs.Int("gid-index", 0, "RDMA GID index")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	dp, err := rdma.Open(rdma.Options{
-		Device:   *device,
+	rdmaDevice, err := openRdmaDevice(rdma.Options{
+		Device:   *deviceName,
 		Port:     uint8(*port),
 		GIDIndex: *gidIndex,
 	})
 	if err != nil {
 		return err
 	}
-	defer dp.Close()
+	defer rdmaDevice.Close()
 
 	return server.Run(ctx, server.Config{
 		Addr:         *addr,
 		ChunkSize:    *chunkSize,
 		ChunkBuffers: *chunkBuffers,
-		DataPlane:    dp,
+		RdmaDevice:   rdmaDevice,
 	})
 }
 
@@ -83,7 +85,7 @@ func runGet(ctx context.Context, args []string) error {
 	output := fs.String("o", "-", "output path, or - for stdout")
 	chunkSize := fs.Uint64("chunk-size", transfer.DefaultChunkSize, "requested chunk buffer size in bytes")
 	chunkBuffers := fs.Int("chunk-buffers", transfer.DefaultChunkBuffers, "requested number of registered chunk buffers")
-	device := fs.String("rdma-device", "", "RDMA verbs device name, empty selects the first device")
+	deviceName := fs.String("rdma-device", "", "RDMA verbs device name, empty selects the first device")
 	port := fs.Uint("rdma-port", 1, "RDMA port number")
 	gidIndex := fs.Int("gid-index", 0, "RDMA GID index")
 	if err := fs.Parse(args); err != nil {
@@ -94,15 +96,15 @@ func runGet(ctx context.Context, args []string) error {
 		return errors.New("get requires exactly one remote path")
 	}
 
-	dp, err := rdma.Open(rdma.Options{
-		Device:   *device,
+	rdmaDevice, err := openRdmaDevice(rdma.Options{
+		Device:   *deviceName,
 		Port:     uint8(*port),
 		GIDIndex: *gidIndex,
 	})
 	if err != nil {
 		return err
 	}
-	defer dp.Close()
+	defer rdmaDevice.Close()
 
 	return client.Run(ctx, client.Config{
 		Addr:         *addr,
@@ -110,7 +112,7 @@ func runGet(ctx context.Context, args []string) error {
 		Output:       *output,
 		ChunkSize:    *chunkSize,
 		ChunkBuffers: *chunkBuffers,
-		DataPlane:    dp,
+		RdmaDevice:   rdmaDevice,
 	})
 }
 

@@ -94,7 +94,7 @@ static struct ibv_qp *rget_create_qp(struct ibv_pd *pd, struct ibv_cq *cq) {
 	return ibv_create_qp(pd, &attr);
 }
 
-static int rget_post_rdma_read(struct ibv_qp *qp, void *dst, uint32_t lkey, uint32_t len, uint64_t remote_addr, uint32_t rkey) {
+static int rget_post_rdma_read_wr_id(struct ibv_qp *qp, uint64_t wr_id, void *dst, uint32_t lkey, uint32_t len, uint64_t remote_addr, uint32_t rkey) {
 	struct ibv_sge sge;
 	memset(&sge, 0, sizeof(sge));
 	sge.addr = (uintptr_t)dst;
@@ -103,7 +103,7 @@ static int rget_post_rdma_read(struct ibv_qp *qp, void *dst, uint32_t lkey, uint
 
 	struct ibv_send_wr wr;
 	memset(&wr, 0, sizeof(wr));
-	wr.wr_id = 1;
+	wr.wr_id = wr_id;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
 	wr.opcode = IBV_WR_RDMA_READ;
@@ -122,33 +122,43 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"unsafe"
 )
 
-type verbsPlane struct {
+type verbsDevice struct {
+	mu       sync.Mutex
 	ctx      *C.struct_ibv_context
 	pd       *C.struct_ibv_pd
 	device   string
 	port     uint8
 	gidIndex int
-}
-
-type verbsConn struct {
-	plane    *verbsPlane
-	cq       *C.struct_ibv_cq
-	qp       *C.struct_ibv_qp
-	endpoint Endpoint
+	conn     *verbsConn
+	conns    []*verbsConn
+	connErr  error
 	closed   bool
 }
 
-type verbsRemoteBuffer struct {
+type verbsConn struct {
+	device    *verbsDevice
+	mu        sync.Mutex
+	nextWRID  uint64
+	done      map[uint64]C.struct_ibv_wc
+	cq        *C.struct_ibv_cq
+	qp        *C.struct_ibv_qp
+	endpoint  Addr
+	connected bool
+	closed    bool
+}
+
+type verbsRdmaBuffer struct {
 	ptr    unsafe.Pointer
 	bytes  []byte
 	mr     *C.struct_ibv_mr
 	closed bool
 }
 
-func open(opts Options) (DataPlane, error) {
+func open(opts Options) (RdmaDevice, error) {
 	port := opts.Port
 	if port == 0 {
 		port = 1
@@ -190,50 +200,133 @@ func open(opts Options) (DataPlane, error) {
 		return nil, fmt.Errorf("rdma: alloc pd failed")
 	}
 
-	return &verbsPlane{
+	device := &verbsDevice{
 		ctx:      ctx,
 		pd:       pd,
 		device:   selectedName,
 		port:     port,
 		gidIndex: opts.GIDIndex,
-	}, nil
+	}
+	conn, err := device.newConn()
+	if err != nil {
+		_ = device.Close()
+		return nil, err
+	}
+	device.conn = conn
+	device.conns = append(device.conns, conn)
+	return device, nil
 }
 
-func (p *verbsPlane) NewConn(ctx context.Context) (Conn, error) {
+func (d *verbsDevice) Info() Addr {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return Addr{
+			Device:   d.device,
+			Port:     d.port,
+			GIDIndex: d.gidIndex,
+		}
+	}
+	if d.conn == nil || d.conn.closed || d.conn.connected {
+		conn, err := d.newConn()
+		if err != nil {
+			d.connErr = err
+			return Addr{
+				Device:   d.device,
+				Port:     d.port,
+				GIDIndex: d.gidIndex,
+			}
+		}
+		d.conn = conn
+		d.conns = append(d.conns, conn)
+		d.connErr = nil
+	}
+	return d.conn.endpoint
+}
+
+func (d *verbsDevice) Connect(ctx context.Context, remote Addr) (Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	cq := C.ibv_create_cq(p.ctx, 128, nil, nil, 0)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.closed {
+		return nil, fmt.Errorf("rdma: device is closed")
+	}
+	if d.connErr != nil {
+		err := d.connErr
+		d.connErr = nil
+		return nil, err
+	}
+	conn := d.conn
+	if conn == nil || conn.closed || conn.connected {
+		var err error
+		conn, err = d.newConn()
+		if err != nil {
+			return nil, err
+		}
+		d.conn = conn
+		d.conns = append(d.conns, conn)
+	}
+
+	useGID := 0
+	if remote.HasGID() {
+		useGID = 1
+	}
+	if rc := C.rget_modify_qp_rtr(
+		conn.qp,
+		C.uint32_t(remote.QPN),
+		C.uint32_t(remote.PSN),
+		C.uint16_t(remote.LID),
+		C.uint8_t(conn.device.port),
+		C.uint8_t(conn.device.gidIndex),
+		(*C.uchar)(unsafe.Pointer(&remote.GID[0])),
+		C.int(useGID),
+	); rc != 0 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("rdma: modify qp RTR failed: %d", int(rc))
+	}
+	if rc := C.rget_modify_qp_rts(conn.qp, C.uint32_t(conn.endpoint.PSN)); rc != 0 {
+		_ = conn.Close()
+		return nil, fmt.Errorf("rdma: modify qp RTS failed: %d", int(rc))
+	}
+	conn.connected = true
+	return conn, nil
+}
+
+func (d *verbsDevice) newConn() (*verbsConn, error) {
+	cq := C.ibv_create_cq(d.ctx, 128, nil, nil, 0)
 	if cq == nil {
 		return nil, fmt.Errorf("rdma: create cq failed")
 	}
 
-	qp := C.rget_create_qp(p.pd, cq)
+	qp := C.rget_create_qp(d.pd, cq)
 	if qp == nil {
 		C.ibv_destroy_cq(cq)
 		return nil, fmt.Errorf("rdma: create qp failed")
 	}
 
-	if rc := C.rget_modify_qp_init(qp, C.uint8_t(p.port)); rc != 0 {
+	if rc := C.rget_modify_qp_init(qp, C.uint8_t(d.port)); rc != 0 {
 		C.ibv_destroy_qp(qp)
 		C.ibv_destroy_cq(cq)
 		return nil, fmt.Errorf("rdma: modify qp INIT failed: %d", int(rc))
 	}
 
 	var portAttr C.struct_ibv_port_attr
-	if rc := C.rget_port_attr(p.ctx, C.uint8_t(p.port), &portAttr); rc != 0 {
+	if rc := C.rget_port_attr(d.ctx, C.uint8_t(d.port), &portAttr); rc != 0 {
 		C.ibv_destroy_qp(qp)
 		C.ibv_destroy_cq(cq)
 		return nil, fmt.Errorf("rdma: query port failed: %d", int(rc))
 	}
 
 	var gid C.union_ibv_gid = C.rget_zero_gid()
-	if p.gidIndex >= 0 {
-		if rc := C.ibv_query_gid(p.ctx, C.uint8_t(p.port), C.int(p.gidIndex), &gid); rc != 0 {
+	if d.gidIndex >= 0 {
+		if rc := C.ibv_query_gid(d.ctx, C.uint8_t(d.port), C.int(d.gidIndex), &gid); rc != 0 {
 			C.ibv_destroy_qp(qp)
 			C.ibv_destroy_cq(cq)
-			return nil, fmt.Errorf("rdma: query gid index %d failed: %d", p.gidIndex, int(rc))
+			return nil, fmt.Errorf("rdma: query gid index %d failed: %d", d.gidIndex, int(rc))
 		}
 	}
 
@@ -245,73 +338,61 @@ func (p *verbsPlane) NewConn(ctx context.Context) (Conn, error) {
 	}
 
 	conn := &verbsConn{
-		plane: p,
-		cq:    cq,
-		qp:    qp,
-		endpoint: Endpoint{
-			Device:   p.device,
-			Port:     p.port,
+		device: d,
+		done:   make(map[uint64]C.struct_ibv_wc),
+		cq:     cq,
+		qp:     qp,
+		endpoint: Addr{
+			Device:   d.device,
+			Port:     d.port,
 			LID:      uint16(portAttr.lid),
 			QPN:      uint32(qp.qp_num),
 			PSN:      psn,
-			GIDIndex: p.gidIndex,
+			GIDIndex: d.gidIndex,
 		},
 	}
 	copy(conn.endpoint.GID[:], C.GoBytes(unsafe.Pointer(&gid), 16))
 	return conn, nil
 }
 
-func (p *verbsPlane) Close() error {
-	if p == nil {
+func (d *verbsDevice) Close() error {
+	if d == nil {
 		return nil
 	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return nil
+	}
+	d.closed = true
 	var err error
-	if p.pd != nil {
-		if rc := C.ibv_dealloc_pd(p.pd); rc != 0 {
+	for _, conn := range d.conns {
+		if closeErr := conn.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	d.conn = nil
+	d.conns = nil
+	if d.pd != nil {
+		if rc := C.ibv_dealloc_pd(d.pd); rc != 0 && err == nil {
 			err = fmt.Errorf("rdma: dealloc pd failed: %d", int(rc))
 		}
-		p.pd = nil
+		d.pd = nil
 	}
-	if p.ctx != nil {
-		if rc := C.ibv_close_device(p.ctx); rc != 0 && err == nil {
+	if d.ctx != nil {
+		if rc := C.ibv_close_device(d.ctx); rc != 0 && err == nil {
 			err = fmt.Errorf("rdma: close device failed: %d", int(rc))
 		}
-		p.ctx = nil
+		d.ctx = nil
 	}
 	return err
 }
 
-func (c *verbsConn) LocalEndpoint() Endpoint {
+func (c *verbsConn) LocalEndpoint() Addr {
 	return c.endpoint
 }
 
-func (c *verbsConn) Connect(ctx context.Context, remote Endpoint) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	useGID := 0
-	if remote.HasGID() {
-		useGID = 1
-	}
-	if rc := C.rget_modify_qp_rtr(
-		c.qp,
-		C.uint32_t(remote.QPN),
-		C.uint32_t(remote.PSN),
-		C.uint16_t(remote.LID),
-		C.uint8_t(c.plane.port),
-		C.uint8_t(c.plane.gidIndex),
-		(*C.uchar)(unsafe.Pointer(&remote.GID[0])),
-		C.int(useGID),
-	); rc != 0 {
-		return fmt.Errorf("rdma: modify qp RTR failed: %d", int(rc))
-	}
-	if rc := C.rget_modify_qp_rts(c.qp, C.uint32_t(c.endpoint.PSN)); rc != 0 {
-		return fmt.Errorf("rdma: modify qp RTS failed: %d", int(rc))
-	}
-	return nil
-}
-
-func (c *verbsConn) RegisterRemoteBuffer(size int) (RemoteBuffer, error) {
+func (c *verbsConn) RegisterRdmaBuffer(size int) (RdmaBuffer, error) {
 	if size <= 0 {
 		return nil, fmt.Errorf("rdma: cannot register empty buffer")
 	}
@@ -321,7 +402,7 @@ func (c *verbsConn) RegisterRemoteBuffer(size int) (RemoteBuffer, error) {
 	}
 
 	mr := C.ibv_reg_mr(
-		c.plane.pd,
+		c.device.pd,
 		cbuf,
 		C.size_t(size),
 		C.IBV_ACCESS_LOCAL_WRITE|C.IBV_ACCESS_REMOTE_READ,
@@ -330,18 +411,18 @@ func (c *verbsConn) RegisterRemoteBuffer(size int) (RemoteBuffer, error) {
 		C.free(cbuf)
 		return nil, fmt.Errorf("rdma: register mr failed")
 	}
-	return &verbsRemoteBuffer{
+	return &verbsRdmaBuffer{
 		ptr:   cbuf,
 		bytes: unsafe.Slice((*byte)(cbuf), size),
 		mr:    mr,
 	}, nil
 }
 
-func (b *verbsRemoteBuffer) Bytes() []byte {
+func (b *verbsRdmaBuffer) Bytes() []byte {
 	return b.bytes
 }
 
-func (b *verbsRemoteBuffer) Region() MemoryRegion {
+func (b *verbsRdmaBuffer) Region() MemoryRegion {
 	if b == nil || b.mr == nil {
 		return MemoryRegion{}
 	}
@@ -352,7 +433,7 @@ func (b *verbsRemoteBuffer) Region() MemoryRegion {
 	}
 }
 
-func (b *verbsRemoteBuffer) Close() error {
+func (b *verbsRdmaBuffer) Close() error {
 	if b == nil || b.closed {
 		return nil
 	}
@@ -372,62 +453,51 @@ func (b *verbsRemoteBuffer) Close() error {
 	return err
 }
 
-func (c *verbsConn) Read(ctx context.Context, dst []byte, remote MemoryRegion) error {
-	if len(dst) == 0 {
+func (c *verbsConn) Read(ctx context.Context, dst RdmaBuffer, remote MemoryRegion) error {
+	buffer, ok := dst.(*verbsRdmaBuffer)
+	if !ok {
+		return fmt.Errorf("rdma: read destination was not registered by this connection")
+	}
+	if buffer.closed || buffer.mr == nil {
+		return fmt.Errorf("rdma: read destination buffer is closed")
+	}
+	dstBytes := dst.Bytes()
+	if remote.Length == 0 {
 		return nil
 	}
-	if uint64(len(dst)) > remote.Length {
-		return fmt.Errorf("rdma: read length %d exceeds remote region %d", len(dst), remote.Length)
+	if remote.Length > uint64(len(dstBytes)) {
+		return fmt.Errorf("rdma: read length %d exceeds local buffer %d", remote.Length, len(dstBytes))
 	}
-	cbuf := C.malloc(C.size_t(len(dst)))
-	if cbuf == nil {
-		return fmt.Errorf("rdma: allocate local read buffer failed")
-	}
-	defer C.free(cbuf)
 
-	mr := C.ibv_reg_mr(
-		c.plane.pd,
-		cbuf,
-		C.size_t(len(dst)),
-		C.IBV_ACCESS_LOCAL_WRITE,
-	)
-	if mr == nil {
-		return fmt.Errorf("rdma: register local read buffer failed")
-	}
-	defer C.ibv_dereg_mr(mr)
-
-	if rc := C.rget_post_rdma_read(
+	wrID := c.nextSendWRID()
+	if rc := C.rget_post_rdma_read_wr_id(
 		c.qp,
-		cbuf,
-		C.uint32_t(mr.lkey),
-		C.uint32_t(len(dst)),
+		C.uint64_t(wrID),
+		buffer.ptr,
+		C.uint32_t(buffer.mr.lkey),
+		C.uint32_t(remote.Length),
 		C.uint64_t(remote.Addr),
 		C.uint32_t(remote.RKey),
 	); rc != 0 {
 		return fmt.Errorf("rdma: post read failed: %d", int(rc))
 	}
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		var wc C.struct_ibv_wc
-		n := C.ibv_poll_cq(c.cq, 1, &wc)
-		if n < 0 {
-			return fmt.Errorf("rdma: poll cq failed: %d", int(n))
-		}
-		if n == 0 {
-			continue
-		}
-		if wc.status != C.IBV_WC_SUCCESS {
-			return fmt.Errorf("rdma: read completion failed: status=%d", int(wc.status))
-		}
-		C.memcpy(unsafe.Pointer(&dst[0]), cbuf, C.size_t(len(dst)))
-		return nil
+	if err := c.waitCompletion(ctx, wrID); err != nil {
+		return err
 	}
+	return nil
 }
 
 func (c *verbsConn) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeLocked()
+}
+
+func (c *verbsConn) closeLocked() error {
 	if c == nil || c.closed {
 		return nil
 	}
@@ -446,6 +516,52 @@ func (c *verbsConn) Close() error {
 		c.cq = nil
 	}
 	return err
+}
+
+func (c *verbsConn) nextSendWRID() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nextWRID++
+	return c.nextWRID
+}
+
+func (c *verbsConn) waitCompletion(ctx context.Context, wrID uint64) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		c.mu.Lock()
+		if wc, ok := c.done[wrID]; ok {
+			delete(c.done, wrID)
+			c.mu.Unlock()
+			return checkCompletion(wc)
+		}
+		var wc C.struct_ibv_wc
+		n := C.ibv_poll_cq(c.cq, 1, &wc)
+		if n < 0 {
+			c.mu.Unlock()
+			return fmt.Errorf("rdma: poll cq failed: %d", int(n))
+		}
+		if n == 0 {
+			c.mu.Unlock()
+			continue
+		}
+		got := uint64(wc.wr_id)
+		if got == wrID {
+			c.mu.Unlock()
+			return checkCompletion(wc)
+		}
+		c.done[got] = wc
+		c.mu.Unlock()
+	}
+}
+
+func checkCompletion(wc C.struct_ibv_wc) error {
+	if wc.status != C.IBV_WC_SUCCESS {
+		return fmt.Errorf("rdma: read completion failed: status=%d", int(wc.status))
+	}
+	return nil
 }
 
 func randomPSN() (uint32, error) {

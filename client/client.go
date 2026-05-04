@@ -21,13 +21,13 @@ type Config struct {
 	Output       string
 	ChunkSize    uint64
 	ChunkBuffers int
-	DataPlane    rdma.DataPlane
+	RdmaDevice   rdma.RdmaDevice
 }
 
 type readResult struct {
-	ready *protocol.ChunkBufferReadyFrame
-	data  []byte
-	err   error
+	ready  *protocol.ChunkBufferReadyFrame
+	buffer rdma.RdmaBuffer
+	err    error
 }
 
 func Run(ctx context.Context, cfg Config) error {
@@ -37,8 +37,8 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Path == "" {
 		return errors.New("client: remote path is required")
 	}
-	if cfg.DataPlane == nil {
-		return errors.New("client: data plane is required")
+	if cfg.RdmaDevice == nil {
+		return errors.New("client: RDMA device is required")
 	}
 	chunkSize := cfg.ChunkSize
 	if chunkSize == 0 {
@@ -55,12 +55,6 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("client: chunk buffers must be positive")
 	}
 
-	dpConn, err := cfg.DataPlane.NewConn(ctx)
-	if err != nil {
-		return err
-	}
-	defer dpConn.Close()
-
 	ctrl, err := dialContext(ctx, cfg.Addr)
 	if err != nil {
 		return err
@@ -71,7 +65,7 @@ func Run(ctx context.Context, cfg Config) error {
 		Path:           cfg.Path,
 		ChunkSize:      chunkSize,
 		ChunkBuffers:   uint32(chunkBuffers),
-		ClientEndpoint: dpConn.LocalEndpoint(),
+		ClientEndpoint: cfg.RdmaDevice.Info(),
 	}); err != nil {
 		return err
 	}
@@ -88,10 +82,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	defer out.Close()
 
-	return runPipeline(ctx, ctrl, dpConn, out, chunkBuffers)
+	return runPipeline(ctx, ctrl, cfg.RdmaDevice, out, chunkSize, chunkBuffers)
 }
 
-func runPipeline(ctx context.Context, ctrl net.Conn, dpConn rdma.Conn, out io.Writer, chunkBuffers int) error {
+func runPipeline(ctx context.Context, ctrl net.Conn, device rdma.RdmaDevice, out io.Writer, chunkSize uint64, chunkBuffers int) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -99,6 +93,17 @@ func runPipeline(ctx context.Context, ctrl net.Conn, dpConn rdma.Conn, out io.Wr
 	resultc := make(chan readResult, chunkBuffers)
 	errc := make(chan error, 1)
 	var ctrlMu sync.Mutex
+	var dpConn rdma.Conn
+	var readBuffers []rdma.RdmaBuffer
+	var freeBuffers chan rdma.RdmaBuffer
+	defer func() {
+		for _, buf := range readBuffers {
+			_ = buf.Close()
+		}
+		if dpConn != nil {
+			_ = dpConn.Close()
+		}
+	}()
 
 	go readReadyFrames(ctrl, readyc, errc)
 
@@ -106,7 +111,26 @@ func runPipeline(ctx context.Context, ctrl net.Conn, dpConn rdma.Conn, out io.Wr
 	connected := false
 	nextWrite := uint64(0)
 	activeReads := 0
+	var queuedReady []*protocol.ChunkBufferReadyFrame
 	pending := make(map[uint64]readResult)
+	startReads := func() {
+		for len(queuedReady) > 0 && freeBuffers != nil {
+			var buffer rdma.RdmaBuffer
+			select {
+			case buffer = <-freeBuffers:
+			default:
+				return
+			}
+			ready := queuedReady[0]
+			queuedReady = queuedReady[1:]
+			workers.Add(1)
+			activeReads++
+			go func() {
+				defer workers.Done()
+				resultc <- readChunk(ctx, dpConn, buffer, ready)
+			}()
+		}
+	}
 
 	for readyc != nil || len(pending) > 0 || activeReads > 0 {
 		select {
@@ -127,19 +151,31 @@ func runPipeline(ctx context.Context, ctrl net.Conn, dpConn rdma.Conn, out io.Wr
 				return nil
 			}
 			if !connected {
-				if err := dpConn.Connect(ctx, ready.ServerEndpoint); err != nil {
+				conn, err := device.Connect(ctx, ready.ServerEndpoint)
+				if err != nil {
 					cancel()
 					workers.Wait()
 					return err
 				}
+				dpConn = conn
 				connected = true
 			}
-			workers.Add(1)
-			activeReads++
-			go func() {
-				defer workers.Done()
-				resultc <- readChunk(ctx, dpConn, ready)
-			}()
+			if ready.Size > chunkSize {
+				cancel()
+				workers.Wait()
+				return fmt.Errorf("client: chunk size %d exceeds requested chunk buffer %d", ready.Size, chunkSize)
+			}
+			if freeBuffers == nil {
+				var err error
+				readBuffers, freeBuffers, err = registerReadBuffers(dpConn, chunkSize, chunkBuffers)
+				if err != nil {
+					cancel()
+					workers.Wait()
+					return err
+				}
+			}
+			queuedReady = append(queuedReady, ready)
+			startReads()
 		case result := <-resultc:
 			activeReads--
 			if result.err != nil {
@@ -158,11 +194,12 @@ func runPipeline(ctx context.Context, ctrl net.Conn, dpConn rdma.Conn, out io.Wr
 				if !ok {
 					break
 				}
-				if _, err := out.Write(next.data); err != nil {
+				if _, err := out.Write(next.buffer.Bytes()[:int(next.ready.Size)]); err != nil {
 					cancel()
 					workers.Wait()
 					return fmt.Errorf("client: write output: %w", err)
 				}
+				freeBuffers <- next.buffer
 				delete(pending, nextWrite)
 				if next.ready.Final {
 					cancel()
@@ -171,9 +208,30 @@ func runPipeline(ctx context.Context, ctrl net.Conn, dpConn rdma.Conn, out io.Wr
 				}
 				nextWrite++
 			}
+			startReads()
 		}
 	}
 	return nil
+}
+
+func registerReadBuffers(dpConn rdma.Conn, chunkSize uint64, chunkBuffers int) ([]rdma.RdmaBuffer, chan rdma.RdmaBuffer, error) {
+	if chunkSize > math.MaxInt {
+		return nil, nil, fmt.Errorf("client: chunk size %d exceeds max int", chunkSize)
+	}
+	buffers := make([]rdma.RdmaBuffer, 0, chunkBuffers)
+	free := make(chan rdma.RdmaBuffer, chunkBuffers)
+	for i := 0; i < chunkBuffers; i++ {
+		buffer, err := dpConn.RegisterRdmaBuffer(int(chunkSize))
+		if err != nil {
+			for _, buffer := range buffers {
+				_ = buffer.Close()
+			}
+			return nil, nil, err
+		}
+		buffers = append(buffers, buffer)
+		free <- buffer
+	}
+	return buffers, free, nil
 }
 
 func readReadyFrames(ctrl net.Conn, readyc chan<- *protocol.ChunkBufferReadyFrame, errc chan<- error) {
@@ -200,20 +258,25 @@ func readReadyFrames(ctrl net.Conn, readyc chan<- *protocol.ChunkBufferReadyFram
 	}
 }
 
-func readChunk(ctx context.Context, dpConn rdma.Conn, ready *protocol.ChunkBufferReadyFrame) readResult {
+func readChunk(ctx context.Context, dpConn rdma.Conn, buffer rdma.RdmaBuffer, ready *protocol.ChunkBufferReadyFrame) readResult {
 	if ready.Size > math.MaxInt {
 		return readResult{
 			ready: ready,
 			err:   fmt.Errorf("client: chunk size %d exceeds max int", ready.Size),
 		}
 	}
-	chunk := make([]byte, int(ready.Size))
+	if uint64(len(buffer.Bytes())) < ready.Size {
+		return readResult{
+			ready: ready,
+			err:   fmt.Errorf("client: RDMA buffer size %d smaller than chunk %d", len(buffer.Bytes()), ready.Size),
+		}
+	}
 	remote := ready.Buffer
 	remote.Length = ready.Size
-	if err := dpConn.Read(ctx, chunk, remote); err != nil {
+	if err := dpConn.Read(ctx, buffer, remote); err != nil {
 		return readResult{ready: ready, err: err}
 	}
-	return readResult{ready: ready, data: chunk}
+	return readResult{ready: ready, buffer: buffer}
 }
 
 func sendAck(ctrl net.Conn, mu *sync.Mutex, ready *protocol.ChunkBufferReadyFrame) error {

@@ -8,17 +8,17 @@ package rdma
 #include <stdlib.h>
 #include <string.h>
 
-static int rdmacp_port_attr(struct ibv_context *ctx, uint8_t port, struct ibv_port_attr *attr) {
+static int rget_port_attr(struct ibv_context *ctx, uint8_t port, struct ibv_port_attr *attr) {
 	return ibv_query_port(ctx, port, attr);
 }
 
-static union ibv_gid rdmacp_zero_gid(void) {
+static union ibv_gid rget_zero_gid(void) {
 	union ibv_gid gid;
 	memset(&gid, 0, sizeof(gid));
 	return gid;
 }
 
-static int rdmacp_modify_qp_init(struct ibv_qp *qp, uint8_t port) {
+static int rget_modify_qp_init(struct ibv_qp *qp, uint8_t port) {
 	struct ibv_qp_attr attr;
 	memset(&attr, 0, sizeof(attr));
 	attr.qp_state = IBV_QPS_INIT;
@@ -32,7 +32,7 @@ static int rdmacp_modify_qp_init(struct ibv_qp *qp, uint8_t port) {
 		IBV_QP_ACCESS_FLAGS);
 }
 
-static int rdmacp_modify_qp_rtr(struct ibv_qp *qp, uint32_t dest_qpn, uint32_t rq_psn, uint16_t dlid, uint8_t port, uint8_t sgid_index, const unsigned char *dgid, int use_gid) {
+static int rget_modify_qp_rtr(struct ibv_qp *qp, uint32_t dest_qpn, uint32_t rq_psn, uint16_t dlid, uint8_t port, uint8_t sgid_index, const unsigned char *dgid, int use_gid) {
 	struct ibv_qp_attr attr;
 	memset(&attr, 0, sizeof(attr));
 	attr.qp_state = IBV_QPS_RTR;
@@ -63,7 +63,7 @@ static int rdmacp_modify_qp_rtr(struct ibv_qp *qp, uint32_t dest_qpn, uint32_t r
 		IBV_QP_MIN_RNR_TIMER);
 }
 
-static int rdmacp_modify_qp_rts(struct ibv_qp *qp, uint32_t sq_psn) {
+static int rget_modify_qp_rts(struct ibv_qp *qp, uint32_t sq_psn) {
 	struct ibv_qp_attr attr;
 	memset(&attr, 0, sizeof(attr));
 	attr.qp_state = IBV_QPS_RTS;
@@ -81,7 +81,7 @@ static int rdmacp_modify_qp_rts(struct ibv_qp *qp, uint32_t sq_psn) {
 		IBV_QP_MAX_QP_RD_ATOMIC);
 }
 
-static struct ibv_qp *rdmacp_create_qp(struct ibv_pd *pd, struct ibv_cq *cq) {
+static struct ibv_qp *rget_create_qp(struct ibv_pd *pd, struct ibv_cq *cq) {
 	struct ibv_qp_init_attr attr;
 	memset(&attr, 0, sizeof(attr));
 	attr.send_cq = cq;
@@ -94,7 +94,7 @@ static struct ibv_qp *rdmacp_create_qp(struct ibv_pd *pd, struct ibv_cq *cq) {
 	return ibv_create_qp(pd, &attr);
 }
 
-static int rdmacp_post_rdma_read(struct ibv_qp *qp, void *dst, uint32_t lkey, uint32_t len, uint64_t remote_addr, uint32_t rkey) {
+static int rget_post_rdma_read(struct ibv_qp *qp, void *dst, uint32_t lkey, uint32_t len, uint64_t remote_addr, uint32_t rkey) {
 	struct ibv_sge sge;
 	memset(&sge, 0, sizeof(sge));
 	sge.addr = (uintptr_t)dst;
@@ -139,6 +139,13 @@ type verbsConn struct {
 	qp       *C.struct_ibv_qp
 	endpoint Endpoint
 	closed   bool
+}
+
+type verbsRemoteBuffer struct {
+	ptr    unsafe.Pointer
+	bytes  []byte
+	mr     *C.struct_ibv_mr
+	closed bool
 }
 
 func open(opts Options) (DataPlane, error) {
@@ -202,26 +209,26 @@ func (p *verbsPlane) NewConn(ctx context.Context) (Conn, error) {
 		return nil, fmt.Errorf("rdma: create cq failed")
 	}
 
-	qp := C.rdmacp_create_qp(p.pd, cq)
+	qp := C.rget_create_qp(p.pd, cq)
 	if qp == nil {
 		C.ibv_destroy_cq(cq)
 		return nil, fmt.Errorf("rdma: create qp failed")
 	}
 
-	if rc := C.rdmacp_modify_qp_init(qp, C.uint8_t(p.port)); rc != 0 {
+	if rc := C.rget_modify_qp_init(qp, C.uint8_t(p.port)); rc != 0 {
 		C.ibv_destroy_qp(qp)
 		C.ibv_destroy_cq(cq)
 		return nil, fmt.Errorf("rdma: modify qp INIT failed: %d", int(rc))
 	}
 
 	var portAttr C.struct_ibv_port_attr
-	if rc := C.rdmacp_port_attr(p.ctx, C.uint8_t(p.port), &portAttr); rc != 0 {
+	if rc := C.rget_port_attr(p.ctx, C.uint8_t(p.port), &portAttr); rc != 0 {
 		C.ibv_destroy_qp(qp)
 		C.ibv_destroy_cq(cq)
 		return nil, fmt.Errorf("rdma: query port failed: %d", int(rc))
 	}
 
-	var gid C.union_ibv_gid = C.rdmacp_zero_gid()
+	var gid C.union_ibv_gid = C.rget_zero_gid()
 	if p.gidIndex >= 0 {
 		if rc := C.ibv_query_gid(p.ctx, C.uint8_t(p.port), C.int(p.gidIndex), &gid); rc != 0 {
 			C.ibv_destroy_qp(qp)
@@ -286,7 +293,7 @@ func (c *verbsConn) Connect(ctx context.Context, remote Endpoint) error {
 	if remote.HasGID() {
 		useGID = 1
 	}
-	if rc := C.rdmacp_modify_qp_rtr(
+	if rc := C.rget_modify_qp_rtr(
 		c.qp,
 		C.uint32_t(remote.QPN),
 		C.uint32_t(remote.PSN),
@@ -298,44 +305,71 @@ func (c *verbsConn) Connect(ctx context.Context, remote Endpoint) error {
 	); rc != 0 {
 		return fmt.Errorf("rdma: modify qp RTR failed: %d", int(rc))
 	}
-	if rc := C.rdmacp_modify_qp_rts(c.qp, C.uint32_t(c.endpoint.PSN)); rc != 0 {
+	if rc := C.rget_modify_qp_rts(c.qp, C.uint32_t(c.endpoint.PSN)); rc != 0 {
 		return fmt.Errorf("rdma: modify qp RTS failed: %d", int(rc))
 	}
 	return nil
 }
 
-func (c *verbsConn) RegisterRemoteRead(buf []byte) (MemoryRegion, func() error, error) {
-	if len(buf) == 0 {
-		return MemoryRegion{}, nil, fmt.Errorf("rdma: cannot register empty buffer")
+func (c *verbsConn) RegisterRemoteBuffer(size int) (RemoteBuffer, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("rdma: cannot register empty buffer")
 	}
-	cbuf := C.malloc(C.size_t(len(buf)))
+	cbuf := C.malloc(C.size_t(size))
 	if cbuf == nil {
-		return MemoryRegion{}, nil, fmt.Errorf("rdma: allocate remote buffer failed")
+		return nil, fmt.Errorf("rdma: allocate remote buffer failed")
 	}
-	C.memcpy(cbuf, unsafe.Pointer(&buf[0]), C.size_t(len(buf)))
 
 	mr := C.ibv_reg_mr(
 		c.plane.pd,
 		cbuf,
-		C.size_t(len(buf)),
+		C.size_t(size),
 		C.IBV_ACCESS_LOCAL_WRITE|C.IBV_ACCESS_REMOTE_READ,
 	)
 	if mr == nil {
 		C.free(cbuf)
-		return MemoryRegion{}, nil, fmt.Errorf("rdma: register mr failed")
+		return nil, fmt.Errorf("rdma: register mr failed")
 	}
-	deregister := func() error {
-		defer C.free(cbuf)
-		if rc := C.ibv_dereg_mr(mr); rc != 0 {
-			return fmt.Errorf("rdma: dereg mr failed: %d", int(rc))
-		}
-		return nil
+	return &verbsRemoteBuffer{
+		ptr:   cbuf,
+		bytes: unsafe.Slice((*byte)(cbuf), size),
+		mr:    mr,
+	}, nil
+}
+
+func (b *verbsRemoteBuffer) Bytes() []byte {
+	return b.bytes
+}
+
+func (b *verbsRemoteBuffer) Region() MemoryRegion {
+	if b == nil || b.mr == nil {
+		return MemoryRegion{}
 	}
 	return MemoryRegion{
-		Addr:   uint64(uintptr(cbuf)),
-		RKey:   uint32(mr.rkey),
-		Length: uint64(len(buf)),
-	}, deregister, nil
+		Addr:   uint64(uintptr(b.ptr)),
+		RKey:   uint32(b.mr.rkey),
+		Length: uint64(len(b.bytes)),
+	}
+}
+
+func (b *verbsRemoteBuffer) Close() error {
+	if b == nil || b.closed {
+		return nil
+	}
+	b.closed = true
+	var err error
+	if b.mr != nil {
+		if rc := C.ibv_dereg_mr(b.mr); rc != 0 {
+			err = fmt.Errorf("rdma: dereg mr failed: %d", int(rc))
+		}
+		b.mr = nil
+	}
+	if b.ptr != nil {
+		C.free(b.ptr)
+		b.ptr = nil
+		b.bytes = nil
+	}
+	return err
 }
 
 func (c *verbsConn) Read(ctx context.Context, dst []byte, remote MemoryRegion) error {
@@ -362,7 +396,7 @@ func (c *verbsConn) Read(ctx context.Context, dst []byte, remote MemoryRegion) e
 	}
 	defer C.ibv_dereg_mr(mr)
 
-	if rc := C.rdmacp_post_rdma_read(
+	if rc := C.rget_post_rdma_read(
 		c.qp,
 		cbuf,
 		C.uint32_t(mr.lkey),

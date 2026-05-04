@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/flaneur2020/rdmacp/protocol"
+	"github.com/flaneur2020/rget/protocol"
 )
 
 var ErrUnsupported = errors.New("rdma: unsupported; rebuild on Linux with -tags rdma and libibverbs")
@@ -12,10 +12,16 @@ var ErrUnsupported = errors.New("rdma: unsupported; rebuild on Linux with -tags 
 type Endpoint = protocol.RDMAEndpoint
 type MemoryRegion = protocol.RDMAMemoryRegion
 
+type RemoteBuffer interface {
+	Bytes() []byte
+	Region() MemoryRegion
+	Close() error
+}
+
 type Conn interface {
 	LocalEndpoint() Endpoint
 	Connect(ctx context.Context, remote Endpoint) error
-	RegisterRemoteRead(buf []byte) (MemoryRegion, func() error, error)
+	RegisterRemoteBuffer(size int) (RemoteBuffer, error)
 	Read(ctx context.Context, dst []byte, remote MemoryRegion) error
 	Close() error
 }

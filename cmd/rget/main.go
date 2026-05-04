@@ -9,8 +9,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/flaneur2020/rdmacp/rdma"
-	"github.com/flaneur2020/rdmacp/session"
+	"github.com/flaneur2020/rget/client"
+	"github.com/flaneur2020/rget/rdma"
+	"github.com/flaneur2020/rget/server"
+	"github.com/flaneur2020/rget/transfer"
 )
 
 func main() {
@@ -47,7 +49,8 @@ func runServe(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	addr := fs.String("listen", ":7471", "TCP control-plane listen address")
-	chunkSize := fs.Uint64("chunk-size", session.DefaultChunkSize, "chunk buffer size in bytes")
+	chunkSize := fs.Uint64("chunk-size", transfer.DefaultChunkSize, "chunk buffer size in bytes")
+	chunkBuffers := fs.Int("chunk-buffers", transfer.DefaultChunkBuffers, "number of registered chunk buffers per session")
 	device := fs.String("rdma-device", "", "RDMA verbs device name, empty selects the first device")
 	port := fs.Uint("rdma-port", 1, "RDMA port number")
 	gidIndex := fs.Int("gid-index", 0, "RDMA GID index")
@@ -65,10 +68,11 @@ func runServe(ctx context.Context, args []string) error {
 	}
 	defer dp.Close()
 
-	return session.RunServer(ctx, session.ServerConfig{
-		Addr:      *addr,
-		ChunkSize: *chunkSize,
-		DataPlane: dp,
+	return server.Run(ctx, server.Config{
+		Addr:         *addr,
+		ChunkSize:    *chunkSize,
+		ChunkBuffers: *chunkBuffers,
+		DataPlane:    dp,
 	})
 }
 
@@ -77,7 +81,8 @@ func runGet(ctx context.Context, args []string) error {
 	fs.SetOutput(os.Stderr)
 	addr := fs.String("addr", "127.0.0.1:7471", "server TCP control-plane address")
 	output := fs.String("o", "-", "output path, or - for stdout")
-	chunkSize := fs.Uint64("chunk-size", session.DefaultChunkSize, "requested chunk buffer size in bytes")
+	chunkSize := fs.Uint64("chunk-size", transfer.DefaultChunkSize, "requested chunk buffer size in bytes")
+	chunkBuffers := fs.Int("chunk-buffers", transfer.DefaultChunkBuffers, "requested number of registered chunk buffers")
 	device := fs.String("rdma-device", "", "RDMA verbs device name, empty selects the first device")
 	port := fs.Uint("rdma-port", 1, "RDMA port number")
 	gidIndex := fs.Int("gid-index", 0, "RDMA GID index")
@@ -99,20 +104,21 @@ func runGet(ctx context.Context, args []string) error {
 	}
 	defer dp.Close()
 
-	return session.RunClient(ctx, session.ClientConfig{
-		Addr:      *addr,
-		Path:      fs.Arg(0),
-		Output:    *output,
-		ChunkSize: *chunkSize,
-		DataPlane: dp,
+	return client.Run(ctx, client.Config{
+		Addr:         *addr,
+		Path:         fs.Arg(0),
+		Output:       *output,
+		ChunkSize:    *chunkSize,
+		ChunkBuffers: *chunkBuffers,
+		DataPlane:    dp,
 	})
 }
 
 func usage(out *os.File) {
 	fmt.Fprintln(out, `usage:
-  rdmacp serve [-listen :7471] [-chunk-size 1048576] [-rdma-device rxe0] [-rdma-port 1] [-gid-index 0]
-  rdmacp get [-addr 127.0.0.1:7471] [-o output] [-chunk-size 1048576] remote-path
+  rget serve [-listen :7471] [-chunk-size 1048576] [-chunk-buffers 4] [-rdma-device rxe0] [-rdma-port 1] [-gid-index 0]
+  rget get [-addr 127.0.0.1:7471] [-o output] [-chunk-size 1048576] [-chunk-buffers 4] remote-path
 
 Build real RDMA support on Linux with:
-  go build -tags rdma ./cmd/rdmacp`)
+  go build -tags rdma ./cmd/rget`)
 }

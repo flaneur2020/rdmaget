@@ -11,7 +11,7 @@ import (
 type FrameKind uint32
 
 const (
-	wireMagic       uint32 = 0x524d4350 // RMCP
+	wireMagic       uint32 = 0x52474554 // RGET
 	wireVersion     uint16 = 1
 	wireHeaderBytes        = 12
 
@@ -64,6 +64,7 @@ type NewSessionFrame struct {
 	SessionID      string       `json:"session_id,omitempty"`
 	Path           string       `json:"path"`
 	ChunkSize      uint64       `json:"chunk_size,omitempty"`
+	ChunkBuffers   uint32       `json:"chunk_buffers,omitempty"`
 	ClientEndpoint RDMAEndpoint `json:"client_endpoint"`
 }
 

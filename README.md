@@ -1,14 +1,14 @@
-# rdmacp
+# rget
 
-`rdmacp` copies a file with a TCP control plane and an RDMA data plane.
+`rget` copies a file with a TCP control plane and an RDMA data plane.
 
 Control flow:
 
 1. Client opens the TCP control connection and sends `NEW_SESSION`.
-2. Server opens the requested file, fills a chunk buffer, registers it for remote read, and sends `CHUNK_BUFFER_READY`.
+2. Server opens the requested file, registers a fixed list of equal-width chunk buffers for remote read, fills available buffers, and sends `CHUNK_BUFFER_READY`.
 3. Client performs an RDMA READ from the advertised chunk buffer.
 4. Client sends `CHUNK_BUFFER_ACK` over the TCP control plane.
-5. Server deregisters/reuses the chunk buffer and repeats until the final chunk.
+5. Server reuses the acknowledged chunk buffer and repeats until the final chunk.
 
 ## Build
 
@@ -16,14 +16,14 @@ Default builds compile everywhere, but real RDMA returns an unsupported error:
 
 ```sh
 go test ./...
-go build ./cmd/rdmacp
+go build ./cmd/rget
 ```
 
 Build real verbs support on Linux with `libibverbs` headers installed:
 
 ```sh
 CGO_ENABLED=1 go test -tags rdma ./...
-CGO_ENABLED=1 go build -tags rdma ./cmd/rdmacp
+CGO_ENABLED=1 go build -tags rdma ./cmd/rget
 ```
 
 ## Run
@@ -31,13 +31,13 @@ CGO_ENABLED=1 go build -tags rdma ./cmd/rdmacp
 On the server:
 
 ```sh
-./rdmacp serve -listen :7471 -rdma-device rxe0 -rdma-port 1 -gid-index 0
+./rget serve -listen :7471 -chunk-buffers 4 -rdma-device rxe0 -rdma-port 1 -gid-index 0
 ```
 
 On the client:
 
 ```sh
-./rdmacp get -addr 127.0.0.1:7471 -o copy.bin /path/on/server/file.bin
+./rget get -addr 127.0.0.1:7471 -chunk-buffers 4 -o copy.bin /path/on/server/file.bin
 ```
 
 For same-host soft-RDMA smoke testing, both commands can run in the same Linux VM.
@@ -57,10 +57,10 @@ ibv_devinfo
 Then build and run:
 
 ```sh
-CGO_ENABLED=1 go build -tags rdma -o rdmacp ./cmd/rdmacp
+CGO_ENABLED=1 go build -tags rdma -o rget ./cmd/rget
 dd if=/dev/urandom of=/tmp/source.bin bs=1M count=8
-./rdmacp serve -listen 127.0.0.1:7471 -rdma-device rxe0 &
-./rdmacp get -addr 127.0.0.1:7471 -rdma-device rxe0 -o /tmp/copy.bin /tmp/source.bin
+./rget serve -listen 127.0.0.1:7471 -rdma-device rxe0 &
+./rget get -addr 127.0.0.1:7471 -rdma-device rxe0 -o /tmp/copy.bin /tmp/source.bin
 cmp /tmp/source.bin /tmp/copy.bin
 ```
 

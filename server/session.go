@@ -67,7 +67,7 @@ func (s *RgetSession) Run(ctx context.Context) error {
 	if err := s.registerChunkBuffers(); err != nil {
 		return err
 	}
-	return s.serveChunks()
+	return s.serveChunks(ctx)
 }
 
 func (s *RgetSession) Close() error {
@@ -171,7 +171,7 @@ func (s *RgetSession) registerChunkBuffers() error {
 	return nil
 }
 
-func (s *RgetSession) serveChunks() error {
+func (s *RgetSession) serveChunks(ctx context.Context) error {
 	if s.totalSize == 0 {
 		return s.sendReady(emptyChunkReady(s.dpConn.LocalEndpoint()))
 	}
@@ -180,7 +180,10 @@ func (s *RgetSession) serveChunks() error {
 		return err
 	}
 	for len(s.inflight) > 0 {
-		ack, err := s.readAck()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		ack, err := s.readAck(ctx)
 		if err != nil {
 			return err
 		}
@@ -247,14 +250,37 @@ func (s *RgetSession) fillNextChunk(buf *chunkBuffer) error {
 	return nil
 }
 
-func (s *RgetSession) readAck() (*protocol.ChunkBufferAckFrame, error) {
-	ackFrame, err := protocol.DecodeFrame(s.ctrl)
-	if err != nil {
+func (s *RgetSession) readAck(ctx context.Context) (*protocol.ChunkBufferAckFrame, error) {
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	ack, ok := ackFrame.(*protocol.ChunkBufferAckFrame)
+
+	type ackResult struct {
+		frame protocol.Frame
+		err   error
+	}
+
+	resultc := make(chan ackResult, 1)
+	go func() {
+		frame, err := protocol.DecodeFrame(s.ctrl)
+		resultc <- ackResult{frame: frame, err: err}
+	}()
+
+	var result ackResult
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result = <-resultc:
+	}
+	if result.err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, result.err
+	}
+	ack, ok := result.frame.(*protocol.ChunkBufferAckFrame)
 	if !ok {
-		return nil, fmt.Errorf("server: expected CHUNK_BUFFER_ACK, got %s", ackFrame.Kind())
+		return nil, fmt.Errorf("server: expected CHUNK_BUFFER_ACK, got %s", result.frame.Kind())
 	}
 	return ack, nil
 }

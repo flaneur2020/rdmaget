@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -106,7 +107,30 @@ func (f ErrorFrame) Kind() FrameKind {
 	return FrameKindError
 }
 
-func EncodeFrame(w io.Writer, frame Frame) error {
+func EncodeFrame(ctx context.Context, w io.Writer, frame Frame) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	errc := make(chan error, 1)
+	go func() {
+		errc <- encodeFrame(w, frame)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-errc:
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return err
+		}
+		return nil
+	}
+}
+
+func encodeFrame(w io.Writer, frame Frame) error {
 	if frame == nil {
 		return errors.New("protocol: cannot encode nil frame")
 	}
@@ -134,7 +158,35 @@ func EncodeFrame(w io.Writer, frame Frame) error {
 	return nil
 }
 
-func DecodeFrame(r io.Reader) (Frame, error) {
+func DecodeFrame(ctx context.Context, r io.Reader) (Frame, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		frame Frame
+		err   error
+	}
+	resultc := make(chan result, 1)
+	go func() {
+		frame, err := decodeFrame(r)
+		resultc <- result{frame: frame, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultc:
+		if result.err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, result.err
+		}
+		return result.frame, nil
+	}
+}
+
+func decodeFrame(r io.Reader) (Frame, error) {
 	var header [wireHeaderBytes]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
 		return nil, fmt.Errorf("protocol: read header: %w", err)

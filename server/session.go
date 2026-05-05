@@ -99,7 +99,7 @@ func (s *RgetSession) Close() error {
 }
 
 func (s *RgetSession) readNewSession(ctx context.Context) error {
-	frame, err := decodeFrame(ctx, s.ctrl)
+	frame, err := protocol.DecodeFrame(ctx, s.ctrl)
 	if err != nil {
 		return err
 	}
@@ -252,7 +252,7 @@ func (s *RgetSession) readAck(ctx context.Context) (*protocol.ChunkBufferAckFram
 		return nil, err
 	}
 
-	ackFrame, err := decodeFrame(ctx, s.ctrl)
+	ackFrame, err := protocol.DecodeFrame(ctx, s.ctrl)
 	if err != nil {
 		return nil, err
 	}
@@ -285,65 +285,14 @@ func (s *RgetSession) sendReady(ctx context.Context, buf *chunkBuffer, endpoint 
 			Buffer:         region,
 		}
 	}
-	return encodeFrame(ctx, s.ctrl, ready)
+	return protocol.EncodeFrame(ctx, s.ctrl, ready)
 }
 
 func (s *RgetSession) sendError(ctx context.Context, kind, message string) error {
-	return encodeFrame(ctx, s.ctrl, &protocol.ErrorFrame{
+	return protocol.EncodeFrame(ctx, s.ctrl, &protocol.ErrorFrame{
 		ErrorKind: kind,
 		Message:   message,
 	})
-}
-
-func decodeFrame(ctx context.Context, r io.Reader) (protocol.Frame, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	type result struct {
-		frame protocol.Frame
-		err   error
-	}
-	resultc := make(chan result, 1)
-	go func() {
-		frame, err := protocol.DecodeFrame(r)
-		resultc <- result{frame: frame, err: err}
-	}()
-
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case result := <-resultc:
-		if result.err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, ctxErr
-			}
-			return nil, result.err
-		}
-		return result.frame, nil
-	}
-}
-
-func encodeFrame(ctx context.Context, w io.Writer, frame protocol.Frame) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	errc := make(chan error, 1)
-	go func() {
-		errc <- protocol.EncodeFrame(w, frame)
-	}()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case err := <-errc:
-		if err != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return ctxErr
-			}
-			return err
-		}
-		return nil
-	}
 }
 
 func (s *RgetSession) eof() bool {

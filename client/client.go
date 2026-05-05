@@ -106,7 +106,7 @@ func (j *RGetJob) Run(ctx context.Context) error {
 	}
 	defer j.Close()
 
-	if err := j.sendNewSession(); err != nil {
+	if err := j.sendNewSession(ctx); err != nil {
 		return err
 	}
 	if err := j.openOutput(); err != nil {
@@ -153,8 +153,8 @@ func (j *RGetJob) openControl(ctx context.Context) error {
 	return nil
 }
 
-func (j *RGetJob) sendNewSession() error {
-	return protocol.EncodeFrame(j.ctrl, &protocol.NewSessionFrame{
+func (j *RGetJob) sendNewSession(ctx context.Context) error {
+	return protocol.EncodeFrame(ctx, j.ctrl, &protocol.NewSessionFrame{
 		Path:           j.cfg.Path,
 		ChunkSize:      j.chunkSize,
 		ChunkBuffers:   uint32(j.chunkBuffers),
@@ -302,7 +302,7 @@ func (j *RGetJob) startReads() {
 func (j *RGetJob) sendAck(ready *protocol.ChunkBufferReadyFrame) error {
 	j.ctrlMu.Lock()
 	defer j.ctrlMu.Unlock()
-	return protocol.EncodeFrame(j.ctrl, &protocol.ChunkBufferAckFrame{
+	return protocol.EncodeFrame(j.ctx, j.ctrl, &protocol.ChunkBufferAckFrame{
 		BufferIndex: ready.BufferIndex,
 		ChunkID:     ready.ChunkID,
 	})
@@ -327,7 +327,7 @@ func (j *RGetJob) finish() error {
 func (j *RGetJob) readReadyFrames() {
 	defer close(j.readyc)
 	for {
-		frame, err := protocol.DecodeFrame(j.ctrl)
+		frame, err := protocol.DecodeFrame(j.ctx, j.ctrl)
 		if err != nil {
 			j.errc <- err
 			return

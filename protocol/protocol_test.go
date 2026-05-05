@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"testing"
@@ -45,13 +46,13 @@ func TestFrameRoundTrip(t *testing.T) {
 
 	var wire bytes.Buffer
 	for _, frame := range frames {
-		if err := EncodeFrame(&wire, frame); err != nil {
+		if err := EncodeFrame(context.Background(), &wire, frame); err != nil {
 			t.Fatalf("EncodeFrame(%s): %v", frame.Kind(), err)
 		}
 	}
 
 	for _, want := range frames {
-		got, err := DecodeFrame(&wire)
+		got, err := DecodeFrame(context.Background(), &wire)
 		if err != nil {
 			t.Fatalf("DecodeFrame(%s): %v", want.Kind(), err)
 		}
@@ -60,7 +61,7 @@ func TestFrameRoundTrip(t *testing.T) {
 		}
 	}
 
-	_, err := DecodeFrame(&wire)
+	_, err := DecodeFrame(context.Background(), &wire)
 	if !errors.Is(err, io.EOF) {
 		t.Fatalf("DecodeFrame EOF = %v, want io.EOF", err)
 	}
@@ -74,7 +75,7 @@ func TestDecodeFrameRejectsBadMagic(t *testing.T) {
 		0, 0, 0, 0,
 	})
 
-	_, err := DecodeFrame(wire)
+	_, err := DecodeFrame(context.Background(), wire)
 	if err == nil {
 		t.Fatal("DecodeFrame succeeded with bad magic")
 	}

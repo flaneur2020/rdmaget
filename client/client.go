@@ -106,7 +106,7 @@ func (j *RGetJob) Run(ctx context.Context) error {
 	}
 	defer j.Close()
 
-	if err := j.sendNewSession(ctx); err != nil {
+	if err := j.sendHandshake(ctx); err != nil {
 		return err
 	}
 	if err := j.openOutput(); err != nil {
@@ -153,8 +153,8 @@ func (j *RGetJob) openControl(ctx context.Context) error {
 	return nil
 }
 
-func (j *RGetJob) sendNewSession(ctx context.Context) error {
-	return protocol.EncodeFrame(ctx, j.ctrl, &protocol.NewSessionFrame{
+func (j *RGetJob) sendHandshake(ctx context.Context) error {
+	return protocol.EncodeFrame(ctx, j.ctrl, &protocol.HandshakeFrame{
 		Path:           j.cfg.Path,
 		ChunkSize:      j.chunkSize,
 		ChunkBuffers:   uint32(j.chunkBuffers),

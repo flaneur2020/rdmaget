@@ -10,7 +10,7 @@ import (
 
 func TestFrameRoundTrip(t *testing.T) {
 	frames := []Frame{
-		&NewSessionFrame{
+		&HandshakeFrame{
 			SessionID: "s1",
 			Path:      "/tmp/file",
 			ChunkSize: 4096,
@@ -71,7 +71,7 @@ func TestDecodeFrameRejectsBadMagic(t *testing.T) {
 	wire := bytes.NewBuffer([]byte{
 		0, 0, 0, 0,
 		0, 1,
-		0, byte(FrameKindNewSession),
+		0, byte(FrameKindHandshake),
 		0, 0, 0, 0,
 	})
 

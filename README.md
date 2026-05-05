@@ -4,7 +4,7 @@
 
 Control flow:
 
-1. Client opens the TCP control connection and sends `NEW_SESSION`.
+1. Client opens the TCP control connection and sends `HANDSHAKE`.
 2. Server opens the requested file, registers a fixed list of equal-width chunk buffers for remote read, fills available buffers, and sends `CHUNK_BUFFER_READY`.
 3. Client performs an RDMA READ from the advertised chunk buffer.
 4. Client sends `CHUNK_BUFFER_ACK` over the TCP control plane.

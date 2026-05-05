@@ -18,8 +18,8 @@ const (
 
 	MaxPayloadLen uint32 = 4 << 20
 
-	// NEW_SESSION must be sent first when the TCP control plane is established.
-	FrameKindNewSession FrameKind = 1
+	// HANDSHAKE must be sent first when the TCP control plane is established.
+	FrameKindHandshake FrameKind = 1
 	// CHUNK_BUFFER_READY is sent by the server after a chunk buffer has been
 	// populated and registered for remote RDMA reads.
 	FrameKindChunkBufferReady FrameKind = 2
@@ -27,9 +27,6 @@ const (
 	// for the advertised chunk buffer.
 	FrameKindChunkBufferAck FrameKind = 3
 	FrameKindError          FrameKind = 4
-
-	// Backward-compatible name for the original skeleton.
-	FrameKindInitSession = FrameKindNewSession
 )
 
 type Frame interface {
@@ -61,7 +58,7 @@ type RDMAMemoryRegion struct {
 	Length uint64 `json:"length"`
 }
 
-type NewSessionFrame struct {
+type HandshakeFrame struct {
 	SessionID      string       `json:"session_id,omitempty"`
 	Path           string       `json:"path"`
 	ChunkSize      uint64       `json:"chunk_size,omitempty"`
@@ -69,11 +66,9 @@ type NewSessionFrame struct {
 	ClientEndpoint RDMAEndpoint `json:"client_endpoint"`
 }
 
-func (f NewSessionFrame) Kind() FrameKind {
-	return FrameKindNewSession
+func (f HandshakeFrame) Kind() FrameKind {
+	return FrameKindHandshake
 }
-
-type InitSessionFrame = NewSessionFrame
 
 type ChunkBufferReadyFrame struct {
 	BufferIndex    uint64           `json:"buffer_index"`
@@ -240,8 +235,8 @@ func DecodeHeader(r io.Reader) (FrameHeader, error) {
 
 func (k FrameKind) String() string {
 	switch k {
-	case FrameKindNewSession:
-		return "NEW_SESSION"
+	case FrameKindHandshake:
+		return "HANDSHAKE"
 	case FrameKindChunkBufferReady:
 		return "CHUNK_BUFFER_READY"
 	case FrameKindChunkBufferAck:
@@ -255,8 +250,8 @@ func (k FrameKind) String() string {
 
 func decodePayload(kind FrameKind, payload []byte) (Frame, error) {
 	switch kind {
-	case FrameKindNewSession:
-		var frame NewSessionFrame
+	case FrameKindHandshake:
+		var frame HandshakeFrame
 		if err := json.Unmarshal(payload, &frame); err != nil {
 			return nil, fmt.Errorf("protocol: decode %s: %w", kind, err)
 		}

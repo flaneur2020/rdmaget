@@ -19,7 +19,7 @@ type RgetSession struct {
 	device       rdma.RdmaDevice
 	dpConn       rdma.Conn
 	file         *os.File
-	request      *protocol.NewSessionFrame
+	request      *protocol.HandshakeFrame
 	chunkBuffers []chunkBuffer
 	chunkSize    uint64
 	totalSize    uint64
@@ -55,7 +55,7 @@ func NewSession(ctrl net.Conn, device rdma.RdmaDevice, chunkSize uint64, chunkBu
 func (s *RgetSession) Run(ctx context.Context) error {
 	defer s.Close()
 
-	if err := s.readNewSession(ctx); err != nil {
+	if err := s.readHandshake(ctx); err != nil {
 		return err
 	}
 	if err := s.openFile(ctx); err != nil {
@@ -98,31 +98,31 @@ func (s *RgetSession) Close() error {
 	return err
 }
 
-func (s *RgetSession) readNewSession(ctx context.Context) error {
+func (s *RgetSession) readHandshake(ctx context.Context) error {
 	frame, err := protocol.DecodeFrame(ctx, s.ctrl)
 	if err != nil {
 		return err
 	}
-	newSession, ok := frame.(*protocol.NewSessionFrame)
+	handshake, ok := frame.(*protocol.HandshakeFrame)
 	if !ok {
-		_ = s.sendError(ctx, "bad_request", "first frame must be NEW_SESSION")
+		_ = s.sendError(ctx, "bad_request", "first frame must be HANDSHAKE")
 		return fmt.Errorf("server: first frame was %s", frame.Kind())
 	}
-	if newSession.Path == "" {
+	if handshake.Path == "" {
 		_ = s.sendError(ctx, "bad_request", "path is required")
 		return errors.New("server: empty path")
 	}
-	if newSession.ChunkSize > 0 {
-		if newSession.ChunkSize > math.MaxInt {
+	if handshake.ChunkSize > 0 {
+		if handshake.ChunkSize > math.MaxInt {
 			_ = s.sendError(ctx, "bad_request", "chunk size exceeds max int")
-			return fmt.Errorf("server: chunk size %d exceeds max int", newSession.ChunkSize)
+			return fmt.Errorf("server: chunk size %d exceeds max int", handshake.ChunkSize)
 		}
-		s.chunkSize = newSession.ChunkSize
+		s.chunkSize = handshake.ChunkSize
 	}
-	if newSession.ChunkBuffers > 0 {
-		s.chunkBuffers = makeChunkBuffers(int(newSession.ChunkBuffers))
+	if handshake.ChunkBuffers > 0 {
+		s.chunkBuffers = makeChunkBuffers(int(handshake.ChunkBuffers))
 	}
-	s.request = newSession
+	s.request = handshake
 	return nil
 }
 

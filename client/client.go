@@ -25,25 +25,25 @@ type Config struct {
 }
 
 type readResultEvent struct {
-	ready  *protocol.ChunkBufferReadyFrame
-	buffer rdma.RdmaBuffer
-	err    error
+	readyChunk *protocol.ChunkBufferReadyFrame
+	buffer     rdma.RdmaBuffer
+	err        error
 }
 
 type readTask struct {
-	ready  *protocol.ChunkBufferReadyFrame
-	buffer rdma.RdmaBuffer
+	readyChunk *protocol.ChunkBufferReadyFrame
+	buffer     rdma.RdmaBuffer
 }
 
-type readyEvent struct {
-	ready *protocol.ChunkBufferReadyFrame
-	err   error
+type readyChunkEvent struct {
+	readyChunk *protocol.ChunkBufferReadyFrame
+	err        error
 }
 
 type slidingWindow struct {
 	nextAckedChunkID uint64
 	activeReads      int
-	readyQueue       chan *protocol.ChunkBufferReadyFrame
+	readyChunkQueue  chan *protocol.ChunkBufferReadyFrame
 	acked            map[uint64]readResultEvent
 	buffers          []rdma.RdmaBuffer
 	freeBuffers      chan rdma.RdmaBuffer
@@ -55,10 +55,10 @@ func newSlidingWindow(conn rdma.Conn, chunkSize uint64, chunkBuffers int) (*slid
 		return nil, err
 	}
 	window := &slidingWindow{
-		acked:       make(map[uint64]readResultEvent),
-		readyQueue:  make(chan *protocol.ChunkBufferReadyFrame, len(buffers)),
-		buffers:     buffers,
-		freeBuffers: make(chan rdma.RdmaBuffer, len(buffers)),
+		acked:           make(map[uint64]readResultEvent),
+		readyChunkQueue: make(chan *protocol.ChunkBufferReadyFrame, len(buffers)),
+		buffers:         buffers,
+		freeBuffers:     make(chan rdma.RdmaBuffer, len(buffers)),
 	}
 	for _, buffer := range buffers {
 		window.freeBuffers <- buffer
@@ -66,25 +66,25 @@ func newSlidingWindow(conn rdma.Conn, chunkSize uint64, chunkBuffers int) (*slid
 	return window, nil
 }
 
-func (w *slidingWindow) addReady(ready *protocol.ChunkBufferReadyFrame) bool {
+func (w *slidingWindow) addReadyChunk(readyChunk *protocol.ChunkBufferReadyFrame) bool {
 	select {
-	case w.readyQueue <- ready:
+	case w.readyChunkQueue <- readyChunk:
 		return true
 	default:
 		return false
 	}
 }
 
-func (w *slidingWindow) popReady() *protocol.ChunkBufferReadyFrame {
-	return <-w.readyQueue
+func (w *slidingWindow) popReadyChunk() *protocol.ChunkBufferReadyFrame {
+	return <-w.readyChunkQueue
 }
 
 func (w *slidingWindow) addAcked(result readResultEvent) {
-	w.acked[result.ready.ChunkID] = result
+	w.acked[result.readyChunk.ChunkID] = result
 }
 
 func (w *slidingWindow) doneReading() bool {
-	return len(w.readyQueue) == 0 && len(w.acked) == 0 && w.activeReads == 0
+	return len(w.readyChunkQueue) == 0 && len(w.acked) == 0 && w.activeReads == 0
 }
 
 func (w *slidingWindow) releaseBuffer(buffer rdma.RdmaBuffer) {
@@ -106,13 +106,13 @@ func (w *slidingWindow) popAcked() (readResultEvent, bool) {
 }
 
 func (w *slidingWindow) nextRead() (readTask, bool) {
-	if len(w.readyQueue) == 0 || len(w.freeBuffers) == 0 {
+	if len(w.readyChunkQueue) == 0 || len(w.freeBuffers) == 0 {
 		return readTask{}, false
 	}
 	w.activeReads++
 	return readTask{
-		ready:  w.popReady(),
-		buffer: <-w.freeBuffers,
+		readyChunk: w.popReadyChunk(),
+		buffer:     <-w.freeBuffers,
 	}, true
 }
 
@@ -141,7 +141,7 @@ type RGetJob struct {
 
 	dpConn rdma.Conn
 
-	readyc      chan readyEvent
+	readyChunkc chan readyChunkEvent
 	readResultc chan readResultEvent
 	workers     sync.WaitGroup
 	window      *slidingWindow
@@ -268,31 +268,31 @@ func (j *RGetJob) run(ctx context.Context) error {
 	j.ctx, j.cancel = context.WithCancel(ctx)
 	defer j.cancel()
 
-	j.readyc = make(chan readyEvent)
+	j.readyChunkc = make(chan readyChunkEvent)
 	j.readResultc = make(chan readResultEvent, j.chunkBuffers)
 
 	go j.readFrames()
 
-	for j.readyc != nil || (j.window != nil && !j.window.doneReading()) {
+	for j.readyChunkc != nil || (j.window != nil && !j.window.doneReading()) {
 		select {
 		case <-j.ctx.Done():
 			return j.stop(j.ctx.Err())
-		case event, ok := <-j.readyc:
+		case event, ok := <-j.readyChunkc:
 			if !ok {
-				j.readyc = nil
+				j.readyChunkc = nil
 				continue
 			}
 			if event.err != nil {
 				return j.stop(event.err)
 			}
-			ready := event.ready
-			if ready.Size == 0 && ready.Final {
+			readyChunk := event.readyChunk
+			if readyChunk.Size == 0 && readyChunk.Final {
 				return j.finish()
 			}
-			if err := j.initDataPlane(ready); err != nil {
+			if err := j.initDataPlane(readyChunk); err != nil {
 				return j.stop(err)
 			}
-			if err := j.handleReady(ready); err != nil {
+			if err := j.handleReadyChunk(readyChunk); err != nil {
 				return j.stop(err)
 			}
 		case result := <-j.readResultc:
@@ -308,12 +308,12 @@ func (j *RGetJob) run(ctx context.Context) error {
 	return nil
 }
 
-func (j *RGetJob) initDataPlane(ready *protocol.ChunkBufferReadyFrame) error {
+func (j *RGetJob) initDataPlane(readyChunk *protocol.ChunkBufferReadyFrame) error {
 	if j.window != nil {
 		return nil
 	}
 	if j.dpConn == nil {
-		conn, err := j.device.Connect(j.ctx, ready.ServerEndpoint)
+		conn, err := j.device.Connect(j.ctx, readyChunk.ServerEndpoint)
 		if err != nil {
 			return err
 		}
@@ -327,12 +327,12 @@ func (j *RGetJob) initDataPlane(ready *protocol.ChunkBufferReadyFrame) error {
 	return nil
 }
 
-func (j *RGetJob) handleReady(ready *protocol.ChunkBufferReadyFrame) error {
-	if ready.Size > j.chunkSize {
-		return fmt.Errorf("client: chunk size %d exceeds requested chunk buffer %d", ready.Size, j.chunkSize)
+func (j *RGetJob) handleReadyChunk(readyChunk *protocol.ChunkBufferReadyFrame) error {
+	if readyChunk.Size > j.chunkSize {
+		return fmt.Errorf("client: chunk size %d exceeds requested chunk buffer %d", readyChunk.Size, j.chunkSize)
 	}
-	if !j.window.addReady(ready) {
-		return fmt.Errorf("client: ready queue is full")
+	if !j.window.addReadyChunk(readyChunk) {
+		return fmt.Errorf("client: ready chunk queue is full")
 	}
 	j.fillReads()
 	return nil
@@ -343,7 +343,7 @@ func (j *RGetJob) handleReadResult(result readResultEvent) (bool, error) {
 	if result.err != nil {
 		return false, result.err
 	}
-	if err := j.sendAck(result.ready); err != nil {
+	if err := j.sendAck(result.readyChunk); err != nil {
 		return false, err
 	}
 	j.window.addAcked(result)
@@ -364,7 +364,7 @@ func (j *RGetJob) fillReads() {
 		j.workers.Add(1)
 		go func() {
 			defer j.workers.Done()
-			j.readResultc <- j.readChunk(task.buffer, task.ready)
+			j.readResultc <- j.readChunk(task.buffer, task.readyChunk)
 		}()
 	}
 }
@@ -375,20 +375,20 @@ func (j *RGetJob) writeAcked() (bool, error) {
 		if !ok {
 			return false, nil
 		}
-		if _, err := j.out.Write(result.buffer.Bytes()[:int(result.ready.Size)]); err != nil {
+		if _, err := j.out.Write(result.buffer.Bytes()[:int(result.readyChunk.Size)]); err != nil {
 			return false, fmt.Errorf("client: write output: %w", err)
 		}
 		j.window.releaseBuffer(result.buffer)
-		if result.ready.Final {
+		if result.readyChunk.Final {
 			return true, nil
 		}
 	}
 }
 
-func (j *RGetJob) sendAck(ready *protocol.ChunkBufferReadyFrame) error {
+func (j *RGetJob) sendAck(readyChunk *protocol.ChunkBufferReadyFrame) error {
 	return protocol.EncodeFrame(j.ctx, j.ctrl, &protocol.ChunkBufferAckFrame{
-		BufferIndex: ready.BufferIndex,
-		ChunkID:     ready.ChunkID,
+		BufferIndex: readyChunk.BufferIndex,
+		ChunkID:     readyChunk.ChunkID,
 	})
 }
 
@@ -409,59 +409,59 @@ func (j *RGetJob) finish() error {
 }
 
 func (j *RGetJob) readFrames() {
-	defer close(j.readyc)
+	defer close(j.readyChunkc)
 	for {
 		frame, err := protocol.DecodeFrame(j.ctx, j.ctrl)
 		if err != nil {
-			j.emitReadyEvent(readyEvent{err: err})
+			j.emitReadyChunkEvent(readyChunkEvent{err: err})
 			return
 		}
 		switch msg := frame.(type) {
 		case *protocol.ChunkBufferReadyFrame:
-			if !j.emitReadyEvent(readyEvent{ready: msg}) {
+			if !j.emitReadyChunkEvent(readyChunkEvent{readyChunk: msg}) {
 				return
 			}
 			if msg.Size == 0 && msg.Final {
 				return
 			}
 		case *protocol.ErrorFrame:
-			j.emitReadyEvent(readyEvent{err: fmt.Errorf("server error [%s]: %s", msg.ErrorKind, msg.Message)})
+			j.emitReadyChunkEvent(readyChunkEvent{err: fmt.Errorf("server error [%s]: %s", msg.ErrorKind, msg.Message)})
 			return
 		default:
-			j.emitReadyEvent(readyEvent{err: fmt.Errorf("client: unexpected frame from server: %s", frame.Kind())})
+			j.emitReadyChunkEvent(readyChunkEvent{err: fmt.Errorf("client: unexpected frame from server: %s", frame.Kind())})
 			return
 		}
 	}
 }
 
-func (j *RGetJob) emitReadyEvent(event readyEvent) bool {
+func (j *RGetJob) emitReadyChunkEvent(event readyChunkEvent) bool {
 	select {
-	case j.readyc <- event:
+	case j.readyChunkc <- event:
 		return true
 	case <-j.ctx.Done():
 		return false
 	}
 }
 
-func (j *RGetJob) readChunk(buffer rdma.RdmaBuffer, ready *protocol.ChunkBufferReadyFrame) readResultEvent {
-	if ready.Size > math.MaxInt {
+func (j *RGetJob) readChunk(buffer rdma.RdmaBuffer, readyChunk *protocol.ChunkBufferReadyFrame) readResultEvent {
+	if readyChunk.Size > math.MaxInt {
 		return readResultEvent{
-			ready: ready,
-			err:   fmt.Errorf("client: chunk size %d exceeds max int", ready.Size),
+			readyChunk: readyChunk,
+			err:        fmt.Errorf("client: chunk size %d exceeds max int", readyChunk.Size),
 		}
 	}
-	if uint64(len(buffer.Bytes())) < ready.Size {
+	if uint64(len(buffer.Bytes())) < readyChunk.Size {
 		return readResultEvent{
-			ready: ready,
-			err:   fmt.Errorf("client: RDMA buffer size %d smaller than chunk %d", len(buffer.Bytes()), ready.Size),
+			readyChunk: readyChunk,
+			err:        fmt.Errorf("client: RDMA buffer size %d smaller than chunk %d", len(buffer.Bytes()), readyChunk.Size),
 		}
 	}
-	remote := ready.Buffer
-	remote.Length = ready.Size
+	remote := readyChunk.Buffer
+	remote.Length = readyChunk.Size
 	if err := j.dpConn.Read(j.ctx, buffer, remote); err != nil {
-		return readResultEvent{ready: ready, err: err}
+		return readResultEvent{readyChunk: readyChunk, err: err}
 	}
-	return readResultEvent{ready: ready, buffer: buffer}
+	return readResultEvent{readyChunk: readyChunk, buffer: buffer}
 }
 
 func dialContext(ctx context.Context, addr string) (net.Conn, error) {

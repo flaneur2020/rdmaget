@@ -9,7 +9,8 @@ import (
 
 var ErrUnsupported = errors.New("rdma: unsupported; rebuild on Linux with -tags rdma and libibverbs")
 
-type Endpoint = protocol.RDMAEndpoint
+type Addr = protocol.RDMAEndpoint
+type Endpoint = Addr
 type MemoryRegion = protocol.RDMAMemoryRegion
 
 type RdmaDevice interface {

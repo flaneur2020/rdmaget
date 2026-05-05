@@ -30,6 +30,11 @@ type readResultEvent struct {
 	err    error
 }
 
+type readTask struct {
+	ready  *protocol.ChunkBufferReadyFrame
+	buffer rdma.RdmaBuffer
+}
+
 type readyEvent struct {
 	ready *protocol.ChunkBufferReadyFrame
 	err   error
@@ -38,7 +43,7 @@ type readyEvent struct {
 type slidingWindow struct {
 	nextAckedChunkID uint64
 	activeReads      int
-	readyQueue       []*protocol.ChunkBufferReadyFrame
+	readyQueue       chan *protocol.ChunkBufferReadyFrame
 	acked            map[uint64]readResultEvent
 	buffers          []rdma.RdmaBuffer
 	freeBuffers      chan rdma.RdmaBuffer
@@ -51,6 +56,7 @@ func newSlidingWindow(conn rdma.Conn, chunkSize uint64, chunkBuffers int) (*slid
 	}
 	window := &slidingWindow{
 		acked:       make(map[uint64]readResultEvent),
+		readyQueue:  make(chan *protocol.ChunkBufferReadyFrame, len(buffers)),
 		buffers:     buffers,
 		freeBuffers: make(chan rdma.RdmaBuffer, len(buffers)),
 	}
@@ -60,14 +66,17 @@ func newSlidingWindow(conn rdma.Conn, chunkSize uint64, chunkBuffers int) (*slid
 	return window, nil
 }
 
-func (w *slidingWindow) addReady(ready *protocol.ChunkBufferReadyFrame) {
-	w.readyQueue = append(w.readyQueue, ready)
+func (w *slidingWindow) addReady(ready *protocol.ChunkBufferReadyFrame) bool {
+	select {
+	case w.readyQueue <- ready:
+		return true
+	default:
+		return false
+	}
 }
 
 func (w *slidingWindow) popReady() *protocol.ChunkBufferReadyFrame {
-	ready := w.readyQueue[0]
-	w.readyQueue = w.readyQueue[1:]
-	return ready
+	return <-w.readyQueue
 }
 
 func (w *slidingWindow) addAcked(result readResultEvent) {
@@ -86,40 +95,25 @@ func (w *slidingWindow) finishRead() {
 	w.activeReads--
 }
 
-func (w *slidingWindow) drainAcked(out io.Writer) (bool, error) {
-	for {
-		result, ok := w.acked[w.nextAckedChunkID]
-		if !ok {
-			return false, nil
-		}
-		delete(w.acked, w.nextAckedChunkID)
-		w.nextAckedChunkID++
-		if _, err := out.Write(result.buffer.Bytes()[:int(result.ready.Size)]); err != nil {
-			return false, fmt.Errorf("client: write output: %w", err)
-		}
-		w.releaseBuffer(result.buffer)
-		if result.ready.Final {
-			return true, nil
-		}
+func (w *slidingWindow) popAcked() (readResultEvent, bool) {
+	result, ok := w.acked[w.nextAckedChunkID]
+	if !ok {
+		return readResultEvent{}, false
 	}
+	delete(w.acked, w.nextAckedChunkID)
+	w.nextAckedChunkID++
+	return result, true
 }
 
-func (w *slidingWindow) fill(workers *sync.WaitGroup, readResultc chan<- readResultEvent, read func(rdma.RdmaBuffer, *protocol.ChunkBufferReadyFrame) readResultEvent) {
-	for len(w.readyQueue) > 0 && w.freeBuffers != nil {
-		var buffer rdma.RdmaBuffer
-		select {
-		case buffer = <-w.freeBuffers:
-		default:
-			return
-		}
-		ready := w.popReady()
-		workers.Add(1)
-		w.activeReads++
-		go func() {
-			defer workers.Done()
-			readResultc <- read(buffer, ready)
-		}()
+func (w *slidingWindow) nextRead() (readTask, bool) {
+	if len(w.readyQueue) == 0 || len(w.freeBuffers) == 0 {
+		return readTask{}, false
 	}
+	w.activeReads++
+	return readTask{
+		ready:  w.popReady(),
+		buffer: <-w.freeBuffers,
+	}, true
 }
 
 func (w *slidingWindow) Close() error {
@@ -337,8 +331,10 @@ func (j *RGetJob) handleReady(ready *protocol.ChunkBufferReadyFrame) error {
 	if ready.Size > j.chunkSize {
 		return fmt.Errorf("client: chunk size %d exceeds requested chunk buffer %d", ready.Size, j.chunkSize)
 	}
-	j.window.addReady(ready)
-	j.window.fill(&j.workers, j.readResultc, j.readChunk)
+	if !j.window.addReady(ready) {
+		return fmt.Errorf("client: ready queue is full")
+	}
+	j.fillReads()
 	return nil
 }
 
@@ -351,12 +347,42 @@ func (j *RGetJob) handleReadResult(result readResultEvent) (bool, error) {
 		return false, err
 	}
 	j.window.addAcked(result)
-	done, err := j.window.drainAcked(j.out)
+	done, err := j.writeAcked()
 	if err != nil {
 		return false, err
 	}
-	j.window.fill(&j.workers, j.readResultc, j.readChunk)
+	j.fillReads()
 	return done, nil
+}
+
+func (j *RGetJob) fillReads() {
+	for {
+		task, ok := j.window.nextRead()
+		if !ok {
+			return
+		}
+		j.workers.Add(1)
+		go func() {
+			defer j.workers.Done()
+			j.readResultc <- j.readChunk(task.buffer, task.ready)
+		}()
+	}
+}
+
+func (j *RGetJob) writeAcked() (bool, error) {
+	for {
+		result, ok := j.window.popAcked()
+		if !ok {
+			return false, nil
+		}
+		if _, err := j.out.Write(result.buffer.Bytes()[:int(result.ready.Size)]); err != nil {
+			return false, fmt.Errorf("client: write output: %w", err)
+		}
+		j.window.releaseBuffer(result.buffer)
+		if result.ready.Final {
+			return true, nil
+		}
+	}
 }
 
 func (j *RGetJob) sendAck(ready *protocol.ChunkBufferReadyFrame) error {

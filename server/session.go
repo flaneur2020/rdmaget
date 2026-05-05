@@ -55,16 +55,16 @@ func NewSession(ctrl net.Conn, device rdma.RdmaDevice, chunkSize uint64, chunkBu
 func (s *RgetSession) Run(ctx context.Context) error {
 	defer s.Close()
 
-	if err := s.readNewSession(); err != nil {
+	if err := s.readNewSession(ctx); err != nil {
 		return err
 	}
-	if err := s.openFile(); err != nil {
+	if err := s.openFile(ctx); err != nil {
 		return err
 	}
 	if err := s.openRDMAConn(ctx); err != nil {
 		return err
 	}
-	if err := s.registerChunkBuffers(); err != nil {
+	if err := s.registerChunkBuffers(ctx); err != nil {
 		return err
 	}
 	return s.serveChunks(ctx)
@@ -98,23 +98,23 @@ func (s *RgetSession) Close() error {
 	return err
 }
 
-func (s *RgetSession) readNewSession() error {
-	frame, err := protocol.DecodeFrame(s.ctrl)
+func (s *RgetSession) readNewSession(ctx context.Context) error {
+	frame, err := decodeFrame(ctx, s.ctrl)
 	if err != nil {
 		return err
 	}
 	newSession, ok := frame.(*protocol.NewSessionFrame)
 	if !ok {
-		_ = s.sendError("bad_request", "first frame must be NEW_SESSION")
+		_ = s.sendError(ctx, "bad_request", "first frame must be NEW_SESSION")
 		return fmt.Errorf("server: first frame was %s", frame.Kind())
 	}
 	if newSession.Path == "" {
-		_ = s.sendError("bad_request", "path is required")
+		_ = s.sendError(ctx, "bad_request", "path is required")
 		return errors.New("server: empty path")
 	}
 	if newSession.ChunkSize > 0 {
 		if newSession.ChunkSize > math.MaxInt {
-			_ = s.sendError("bad_request", "chunk size exceeds max int")
+			_ = s.sendError(ctx, "bad_request", "chunk size exceeds max int")
 			return fmt.Errorf("server: chunk size %d exceeds max int", newSession.ChunkSize)
 		}
 		s.chunkSize = newSession.ChunkSize
@@ -126,21 +126,21 @@ func (s *RgetSession) readNewSession() error {
 	return nil
 }
 
-func (s *RgetSession) openFile() error {
+func (s *RgetSession) openFile(ctx context.Context) error {
 	file, err := os.Open(s.request.Path)
 	if err != nil {
-		_ = s.sendError("open_failed", err.Error())
+		_ = s.sendError(ctx, "open_failed", err.Error())
 		return fmt.Errorf("server: open %q: %w", s.request.Path, err)
 	}
 	s.file = file
 
 	stat, err := s.file.Stat()
 	if err != nil {
-		_ = s.sendError("stat_failed", err.Error())
+		_ = s.sendError(ctx, "stat_failed", err.Error())
 		return fmt.Errorf("server: stat %q: %w", s.request.Path, err)
 	}
 	if stat.IsDir() {
-		_ = s.sendError("bad_request", "path is a directory")
+		_ = s.sendError(ctx, "bad_request", "path is a directory")
 		return fmt.Errorf("server: path %q is a directory", s.request.Path)
 	}
 
@@ -151,17 +151,17 @@ func (s *RgetSession) openFile() error {
 func (s *RgetSession) openRDMAConn(ctx context.Context) error {
 	dpConn, err := s.device.Connect(ctx, s.request.ClientEndpoint)
 	if err != nil {
-		_ = s.sendError("rdma_connect_failed", err.Error())
+		_ = s.sendError(ctx, "rdma_connect_failed", err.Error())
 		return err
 	}
 	s.dpConn = dpConn
 	return nil
 }
 
-func (s *RgetSession) registerChunkBuffers() error {
+func (s *RgetSession) registerChunkBuffers(ctx context.Context) error {
 	buffers, err := s.dpConn.RegisterRdmaBuffers(int(s.chunkSize), len(s.chunkBuffers))
 	if err != nil {
-		_ = s.sendError("rdma_register_failed", err.Error())
+		_ = s.sendError(ctx, "rdma_register_failed", err.Error())
 		return err
 	}
 	for i, buffer := range buffers {
@@ -173,16 +173,13 @@ func (s *RgetSession) registerChunkBuffers() error {
 
 func (s *RgetSession) serveChunks(ctx context.Context) error {
 	if s.totalSize == 0 {
-		return s.sendReady(emptyChunkReady(s.dpConn.LocalEndpoint()))
+		return s.sendReady(ctx, nil, s.dpConn.LocalEndpoint())
 	}
 
-	if err := s.fillWindow(); err != nil {
+	if err := s.fillWindow(ctx); err != nil {
 		return err
 	}
 	for len(s.inflight) > 0 {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
 		ack, err := s.readAck(ctx)
 		if err != nil {
 			return err
@@ -198,10 +195,10 @@ func (s *RgetSession) serveChunks(ctx context.Context) error {
 		delete(s.inflight, ack.ChunkID)
 		buf.resetChunk()
 		if !s.eof() {
-			if err := s.fillNextChunk(buf); err != nil {
+			if err := s.fillNextChunk(ctx, buf); err != nil {
 				return err
 			}
-			if err := s.sendReady(buf.readyFrame(s.dpConn.LocalEndpoint())); err != nil {
+			if err := s.sendReady(ctx, buf, s.dpConn.LocalEndpoint()); err != nil {
 				return err
 			}
 		}
@@ -209,33 +206,33 @@ func (s *RgetSession) serveChunks(ctx context.Context) error {
 	return nil
 }
 
-func (s *RgetSession) fillWindow() error {
+func (s *RgetSession) fillWindow(ctx context.Context) error {
 	for i := range s.chunkBuffers {
 		if s.eof() {
 			return nil
 		}
 		buf := &s.chunkBuffers[i]
-		if err := s.fillNextChunk(buf); err != nil {
+		if err := s.fillNextChunk(ctx, buf); err != nil {
 			return err
 		}
-		if err := s.sendReady(buf.readyFrame(s.dpConn.LocalEndpoint())); err != nil {
+		if err := s.sendReady(ctx, buf, s.dpConn.LocalEndpoint()); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *RgetSession) fillNextChunk(buf *chunkBuffer) error {
+func (s *RgetSession) fillNextChunk(ctx context.Context, buf *chunkBuffer) error {
 	offset, err := s.file.Seek(0, io.SeekCurrent)
 	if err != nil {
-		_ = s.sendError("seek_failed", err.Error())
+		_ = s.sendError(ctx, "seek_failed", err.Error())
 		return fmt.Errorf("server: current file offset: %w", err)
 	}
 	want := min(s.chunkSize, s.totalSize-uint64(offset))
 	dst := buf.data[:int(want)]
 	n, readErr := io.ReadFull(s.file, dst)
 	if readErr != nil {
-		_ = s.sendError("read_failed", readErr.Error())
+		_ = s.sendError(ctx, "read_failed", readErr.Error())
 		return fmt.Errorf("server: read file: %w", readErr)
 	}
 	if n == 0 {
@@ -255,64 +252,103 @@ func (s *RgetSession) readAck(ctx context.Context) (*protocol.ChunkBufferAckFram
 		return nil, err
 	}
 
-	type ackResult struct {
-		frame protocol.Frame
-		err   error
+	ackFrame, err := decodeFrame(ctx, s.ctrl)
+	if err != nil {
+		return nil, err
 	}
-
-	resultc := make(chan ackResult, 1)
-	go func() {
-		frame, err := protocol.DecodeFrame(s.ctrl)
-		resultc <- ackResult{frame: frame, err: err}
-	}()
-
-	var result ackResult
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case result = <-resultc:
-	}
-	if result.err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return nil, ctxErr
-		}
-		return nil, result.err
-	}
-	ack, ok := result.frame.(*protocol.ChunkBufferAckFrame)
+	ack, ok := ackFrame.(*protocol.ChunkBufferAckFrame)
 	if !ok {
-		return nil, fmt.Errorf("server: expected CHUNK_BUFFER_ACK, got %s", result.frame.Kind())
+		return nil, fmt.Errorf("server: expected CHUNK_BUFFER_ACK, got %s", ackFrame.Kind())
 	}
 	return ack, nil
 }
 
-func (s *RgetSession) sendReady(ready *protocol.ChunkBufferReadyFrame) error {
-	return protocol.EncodeFrame(s.ctrl, ready)
+func (s *RgetSession) sendReady(ctx context.Context, buf *chunkBuffer, endpoint rdma.Endpoint) error {
+	ready := &protocol.ChunkBufferReadyFrame{
+		BufferIndex:    0,
+		ChunkID:        0,
+		Offset:         0,
+		Size:           0,
+		Final:          true,
+		ServerEndpoint: endpoint,
+	}
+	if buf != nil {
+		region := buf.remote.Region()
+		region.Length = buf.size
+		ready = &protocol.ChunkBufferReadyFrame{
+			BufferIndex:    buf.index,
+			ChunkID:        buf.chunkID,
+			Offset:         buf.offset,
+			Size:           buf.size,
+			Final:          buf.final,
+			ServerEndpoint: endpoint,
+			Buffer:         region,
+		}
+	}
+	return encodeFrame(ctx, s.ctrl, ready)
 }
 
-func (s *RgetSession) sendError(kind, message string) error {
-	return protocol.EncodeFrame(s.ctrl, &protocol.ErrorFrame{
+func (s *RgetSession) sendError(ctx context.Context, kind, message string) error {
+	return encodeFrame(ctx, s.ctrl, &protocol.ErrorFrame{
 		ErrorKind: kind,
 		Message:   message,
 	})
 }
 
+func decodeFrame(ctx context.Context, r io.Reader) (protocol.Frame, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	type result struct {
+		frame protocol.Frame
+		err   error
+	}
+	resultc := make(chan result, 1)
+	go func() {
+		frame, err := protocol.DecodeFrame(r)
+		resultc <- result{frame: frame, err: err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-resultc:
+		if result.err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			return nil, result.err
+		}
+		return result.frame, nil
+	}
+}
+
+func encodeFrame(ctx context.Context, w io.Writer, frame protocol.Frame) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	errc := make(chan error, 1)
+	go func() {
+		errc <- protocol.EncodeFrame(w, frame)
+	}()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-errc:
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			return err
+		}
+		return nil
+	}
+}
+
 func (s *RgetSession) eof() bool {
 	offset, err := s.file.Seek(0, io.SeekCurrent)
 	return err == nil && uint64(offset) >= s.totalSize
-}
-
-func (b *chunkBuffer) readyFrame(endpoint rdma.Endpoint) *protocol.ChunkBufferReadyFrame {
-	region := b.remote.Region()
-	region.Length = b.size
-	return &protocol.ChunkBufferReadyFrame{
-		BufferIndex:    b.index,
-		ChunkID:        b.chunkID,
-		Offset:         b.offset,
-		Size:           b.size,
-		Final:          b.final,
-		ServerEndpoint: endpoint,
-		Buffer:         region,
-	}
 }
 
 func (b *chunkBuffer) resetChunk() {
@@ -331,17 +367,6 @@ func (b *chunkBuffer) Close() error {
 	b.remote = nil
 	b.data = nil
 	return err
-}
-
-func emptyChunkReady(endpoint rdma.Endpoint) *protocol.ChunkBufferReadyFrame {
-	return &protocol.ChunkBufferReadyFrame{
-		BufferIndex:    0,
-		ChunkID:        0,
-		Offset:         0,
-		Size:           0,
-		Final:          true,
-		ServerEndpoint: endpoint,
-	}
 }
 
 func makeChunkBuffers(count int) []chunkBuffer {

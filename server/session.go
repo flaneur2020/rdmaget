@@ -159,14 +159,14 @@ func (s *RgetSession) openRDMAConn(ctx context.Context) error {
 }
 
 func (s *RgetSession) registerChunkBuffers() error {
-	for i := range s.chunkBuffers {
-		remote, err := s.dpConn.RegisterRdmaBuffer(int(s.chunkSize))
-		if err != nil {
-			_ = s.sendError("rdma_register_failed", err.Error())
-			return err
-		}
-		s.chunkBuffers[i].remote = remote
-		s.chunkBuffers[i].data = remote.Bytes()
+	buffers, err := s.dpConn.RegisterRdmaBuffers(int(s.chunkSize), len(s.chunkBuffers))
+	if err != nil {
+		_ = s.sendError("rdma_register_failed", err.Error())
+		return err
+	}
+	for i, buffer := range buffers {
+		s.chunkBuffers[i].remote = buffer
+		s.chunkBuffers[i].data = buffer.Bytes()
 	}
 	return nil
 }
@@ -195,7 +195,10 @@ func (s *RgetSession) serveChunks() error {
 		delete(s.inflight, ack.ChunkID)
 		buf.resetChunk()
 		if !s.eof() {
-			if err := s.fillBuffer(buf); err != nil {
+			if err := s.fillNextChunk(buf); err != nil {
+				return err
+			}
+			if err := s.sendReady(buf.readyFrame(s.dpConn.LocalEndpoint())); err != nil {
 				return err
 			}
 		}
@@ -208,14 +211,18 @@ func (s *RgetSession) fillWindow() error {
 		if s.eof() {
 			return nil
 		}
-		if err := s.fillBuffer(&s.chunkBuffers[i]); err != nil {
+		buf := &s.chunkBuffers[i]
+		if err := s.fillNextChunk(buf); err != nil {
+			return err
+		}
+		if err := s.sendReady(buf.readyFrame(s.dpConn.LocalEndpoint())); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *RgetSession) fillBuffer(buf *chunkBuffer) error {
+func (s *RgetSession) fillNextChunk(buf *chunkBuffer) error {
 	offset, err := s.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		_ = s.sendError("seek_failed", err.Error())
@@ -237,7 +244,7 @@ func (s *RgetSession) fillBuffer(buf *chunkBuffer) error {
 	buf.size = uint64(n)
 	buf.final = uint64(offset)+uint64(n) == s.totalSize
 	s.inflight[buf.chunkID] = buf
-	return s.sendReady(buf.readyFrame(s.dpConn.LocalEndpoint()))
+	return nil
 }
 
 func (s *RgetSession) readAck() (*protocol.ChunkBufferAckFrame, error) {

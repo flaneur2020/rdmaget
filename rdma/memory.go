@@ -3,14 +3,16 @@ package rdma
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var memoryTransport struct {
-	nextID  atomic.Uint64
-	regions sync.Map
+	nextID   atomic.Uint64
+	nextAddr atomic.Uint64
+	regions  sync.Map
 }
 
 // MemoryDevice is an in-memory RdmaDevice implementation for tests and local simulations.
@@ -28,9 +30,17 @@ type memoryConn struct {
 }
 
 type memoryRdmaBuffer struct {
-	id     uint64
+	region *memoryRdmaRegion
+	offset int
+	size   int
+	closed atomic.Bool
+}
+
+type memoryRdmaRegion struct {
+	base   uint64
 	rkey   uint32
 	buffer []byte
+	refs   atomic.Int64
 }
 
 // NewMemoryDevice returns an in-memory RDMA device that shares memory with other memory devices.
@@ -88,15 +98,36 @@ func (c *memoryConn) LocalEndpoint() Endpoint {
 	return c.local
 }
 
-func (c *memoryConn) RegisterRdmaBuffer(size int) (RdmaBuffer, error) {
-	id := memoryTransport.nextID.Add(1)
-	buffer := make([]byte, size)
-	memoryTransport.regions.Store(id, buffer)
-	return &memoryRdmaBuffer{
-		id:     id,
-		rkey:   uint32(id),
-		buffer: buffer,
-	}, nil
+func (c *memoryConn) RegisterRdmaBuffers(size int, count int) ([]RdmaBuffer, error) {
+	if size <= 0 {
+		return nil, fmt.Errorf("memory rdma: cannot register empty buffer")
+	}
+	if count <= 0 {
+		return nil, fmt.Errorf("memory rdma: buffer count must be positive")
+	}
+	if count > math.MaxInt/size {
+		return nil, fmt.Errorf("memory rdma: total buffer size exceeds max int")
+	}
+
+	total := size * count
+	end := memoryTransport.nextAddr.Add(uint64(total) + 1)
+	region := &memoryRdmaRegion{
+		base:   end - uint64(total),
+		rkey:   uint32(memoryTransport.nextID.Add(1)),
+		buffer: make([]byte, total),
+	}
+	region.refs.Store(int64(count))
+	memoryTransport.regions.Store(region.base, region)
+
+	buffers := make([]RdmaBuffer, 0, count)
+	for i := 0; i < count; i++ {
+		buffers = append(buffers, &memoryRdmaBuffer{
+			region: region,
+			offset: i * size,
+			size:   size,
+		})
+	}
+	return buffers, nil
 }
 
 func (c *memoryConn) Read(ctx context.Context, dst RdmaBuffer, remote MemoryRegion) error {
@@ -120,18 +151,19 @@ func (c *memoryConn) Read(ctx context.Context, dst RdmaBuffer, remote MemoryRegi
 	defer c.device.activeReads.Add(-1)
 	time.Sleep(5 * time.Millisecond)
 
-	value, ok := memoryTransport.regions.Load(remote.Addr)
+	region, offset, ok := findMemoryRegion(remote.Addr)
 	if !ok {
 		return fmt.Errorf("memory rdma: region %d not found", remote.Addr)
 	}
-	src := value.([]byte)
-	if uint32(remote.Addr) != remote.RKey {
+	if region.rkey != remote.RKey {
 		return fmt.Errorf("memory rdma: bad rkey")
 	}
-	if remote.Length > uint64(len(src)) {
-		return fmt.Errorf("memory rdma: read length %d exceeds region %d", remote.Length, len(src))
+	if remote.Length > uint64(len(region.buffer))-offset {
+		return fmt.Errorf("memory rdma: read length %d exceeds region %d", remote.Length, len(region.buffer))
 	}
-	copy(dstBytes[:int(remote.Length)], src[:int(remote.Length)])
+	start := int(offset)
+	end := start + int(remote.Length)
+	copy(dstBytes[:int(remote.Length)], region.buffer[start:end])
 	return nil
 }
 
@@ -139,20 +171,51 @@ func (c *memoryConn) Close() error {
 	return nil
 }
 
+func findMemoryRegion(addr uint64) (*memoryRdmaRegion, uint64, bool) {
+	var found *memoryRdmaRegion
+	var offset uint64
+	memoryTransport.regions.Range(func(_, value any) bool {
+		region := value.(*memoryRdmaRegion)
+		if addr < region.base {
+			return true
+		}
+		currentOffset := addr - region.base
+		if currentOffset >= uint64(len(region.buffer)) {
+			return true
+		}
+		found = region
+		offset = currentOffset
+		return false
+	})
+	return found, offset, found != nil
+}
+
 func (b *memoryRdmaBuffer) Bytes() []byte {
-	return b.buffer
+	if b == nil || b.region == nil {
+		return nil
+	}
+	return b.region.buffer[b.offset : b.offset+b.size]
 }
 
 func (b *memoryRdmaBuffer) Region() MemoryRegion {
+	if b == nil || b.region == nil {
+		return MemoryRegion{}
+	}
 	return MemoryRegion{
-		Addr:   b.id,
-		RKey:   b.rkey,
-		Length: uint64(len(b.buffer)),
+		Addr:   b.region.base + uint64(b.offset),
+		RKey:   b.region.rkey,
+		Length: uint64(b.size),
 	}
 }
 
 func (b *memoryRdmaBuffer) Close() error {
-	memoryTransport.regions.Delete(b.id)
-	b.buffer = nil
+	if b == nil || !b.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	if b.region != nil && b.region.refs.Add(-1) == 0 {
+		memoryTransport.regions.Delete(b.region.base)
+		b.region.buffer = nil
+	}
+	b.region = nil
 	return nil
 }

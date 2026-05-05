@@ -122,7 +122,9 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
@@ -146,15 +148,24 @@ type verbsConn struct {
 	done      map[uint64]C.struct_ibv_wc
 	cq        *C.struct_ibv_cq
 	qp        *C.struct_ibv_qp
-	endpoint  Addr
+	endpoint  Endpoint
 	connected bool
 	closed    bool
 }
 
 type verbsRdmaBuffer struct {
+	region *verbsRdmaRegion
+	ptr    unsafe.Pointer
+	bytes  []byte
+	closed atomic.Bool
+}
+
+type verbsRdmaRegion struct {
+	mu     sync.Mutex
 	ptr    unsafe.Pointer
 	bytes  []byte
 	mr     *C.struct_ibv_mr
+	refs   atomic.Int64
 	closed bool
 }
 
@@ -217,11 +228,11 @@ func open(opts Options) (RdmaDevice, error) {
 	return device, nil
 }
 
-func (d *verbsDevice) Info() Addr {
+func (d *verbsDevice) Info() Endpoint {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
-		return Addr{
+		return Endpoint{
 			Device:   d.device,
 			Port:     d.port,
 			GIDIndex: d.gidIndex,
@@ -231,7 +242,7 @@ func (d *verbsDevice) Info() Addr {
 		conn, err := d.newConn()
 		if err != nil {
 			d.connErr = err
-			return Addr{
+			return Endpoint{
 				Device:   d.device,
 				Port:     d.port,
 				GIDIndex: d.gidIndex,
@@ -244,7 +255,7 @@ func (d *verbsDevice) Info() Addr {
 	return d.conn.endpoint
 }
 
-func (d *verbsDevice) Connect(ctx context.Context, remote Addr) (Conn, error) {
+func (d *verbsDevice) Connect(ctx context.Context, remote Endpoint) (Conn, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -342,7 +353,7 @@ func (d *verbsDevice) newConn() (*verbsConn, error) {
 		done:   make(map[uint64]C.struct_ibv_wc),
 		cq:     cq,
 		qp:     qp,
-		endpoint: Addr{
+		endpoint: Endpoint{
 			Device:   d.device,
 			Port:     d.port,
 			LID:      uint16(portAttr.lid),
@@ -388,15 +399,23 @@ func (d *verbsDevice) Close() error {
 	return err
 }
 
-func (c *verbsConn) LocalEndpoint() Addr {
+func (c *verbsConn) LocalEndpoint() Endpoint {
 	return c.endpoint
 }
 
-func (c *verbsConn) RegisterRdmaBuffer(size int) (RdmaBuffer, error) {
+func (c *verbsConn) RegisterRdmaBuffers(size int, count int) ([]RdmaBuffer, error) {
 	if size <= 0 {
 		return nil, fmt.Errorf("rdma: cannot register empty buffer")
 	}
-	cbuf := C.malloc(C.size_t(size))
+	if count <= 0 {
+		return nil, fmt.Errorf("rdma: buffer count must be positive")
+	}
+	if count > math.MaxInt/size {
+		return nil, fmt.Errorf("rdma: total buffer size exceeds max int")
+	}
+
+	total := size * count
+	cbuf := C.malloc(C.size_t(total))
 	if cbuf == nil {
 		return nil, fmt.Errorf("rdma: allocate remote buffer failed")
 	}
@@ -404,18 +423,31 @@ func (c *verbsConn) RegisterRdmaBuffer(size int) (RdmaBuffer, error) {
 	mr := C.ibv_reg_mr(
 		c.device.pd,
 		cbuf,
-		C.size_t(size),
+		C.size_t(total),
 		C.IBV_ACCESS_LOCAL_WRITE|C.IBV_ACCESS_REMOTE_READ,
 	)
 	if mr == nil {
 		C.free(cbuf)
 		return nil, fmt.Errorf("rdma: register mr failed")
 	}
-	return &verbsRdmaBuffer{
+
+	region := &verbsRdmaRegion{
 		ptr:   cbuf,
-		bytes: unsafe.Slice((*byte)(cbuf), size),
+		bytes: unsafe.Slice((*byte)(cbuf), total),
 		mr:    mr,
-	}, nil
+	}
+	region.refs.Store(int64(count))
+
+	buffers := make([]RdmaBuffer, 0, count)
+	for i := 0; i < count; i++ {
+		offset := i * size
+		buffers = append(buffers, &verbsRdmaBuffer{
+			region: region,
+			ptr:    unsafe.Add(cbuf, offset),
+			bytes:  region.bytes[offset : offset+size],
+		})
+	}
+	return buffers, nil
 }
 
 func (b *verbsRdmaBuffer) Bytes() []byte {
@@ -423,32 +455,52 @@ func (b *verbsRdmaBuffer) Bytes() []byte {
 }
 
 func (b *verbsRdmaBuffer) Region() MemoryRegion {
-	if b == nil || b.mr == nil {
+	if b == nil || b.region == nil || b.region.mr == nil {
 		return MemoryRegion{}
 	}
 	return MemoryRegion{
 		Addr:   uint64(uintptr(b.ptr)),
-		RKey:   uint32(b.mr.rkey),
+		RKey:   uint32(b.region.mr.rkey),
 		Length: uint64(len(b.bytes)),
 	}
 }
 
 func (b *verbsRdmaBuffer) Close() error {
-	if b == nil || b.closed {
+	if b == nil || !b.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-	b.closed = true
-	var err error
-	if b.mr != nil {
-		if rc := C.ibv_dereg_mr(b.mr); rc != 0 {
-			err = fmt.Errorf("rdma: dereg mr failed: %d", int(rc))
-		}
-		b.mr = nil
-	}
-	if b.ptr != nil {
-		C.free(b.ptr)
+	defer func() {
+		b.region = nil
 		b.ptr = nil
 		b.bytes = nil
+	}()
+	if b.region == nil {
+		return nil
+	}
+	return b.region.release()
+}
+
+func (r *verbsRdmaRegion) release() error {
+	if r.refs.Add(-1) > 0 {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	var err error
+	if r.mr != nil {
+		if rc := C.ibv_dereg_mr(r.mr); rc != 0 {
+			err = fmt.Errorf("rdma: dereg mr failed: %d", int(rc))
+		}
+		r.mr = nil
+	}
+	if r.ptr != nil {
+		C.free(r.ptr)
+		r.ptr = nil
+		r.bytes = nil
 	}
 	return err
 }
@@ -458,7 +510,7 @@ func (c *verbsConn) Read(ctx context.Context, dst RdmaBuffer, remote MemoryRegio
 	if !ok {
 		return fmt.Errorf("rdma: read destination was not registered by this connection")
 	}
-	if buffer.closed || buffer.mr == nil {
+	if buffer.closed.Load() || buffer.region == nil || buffer.region.mr == nil {
 		return fmt.Errorf("rdma: read destination buffer is closed")
 	}
 	dstBytes := dst.Bytes()
@@ -474,7 +526,7 @@ func (c *verbsConn) Read(ctx context.Context, dst RdmaBuffer, remote MemoryRegio
 		c.qp,
 		C.uint64_t(wrID),
 		buffer.ptr,
-		C.uint32_t(buffer.mr.lkey),
+		C.uint32_t(buffer.region.mr.lkey),
 		C.uint32_t(remote.Length),
 		C.uint64_t(remote.Addr),
 		C.uint32_t(remote.RKey),

@@ -267,19 +267,14 @@ func (j *RGetJob) handleResult(result readResult) (bool, error) {
 }
 
 func (j *RGetJob) registerReadBuffers() error {
-	j.readBuffers = make([]rdma.RdmaBuffer, 0, j.chunkBuffers)
+	buffers, err := j.dpConn.RegisterRdmaBuffers(int(j.chunkSize), j.chunkBuffers)
+	if err != nil {
+		return err
+	}
+
+	j.readBuffers = buffers
 	j.freeBuffers = make(chan rdma.RdmaBuffer, j.chunkBuffers)
-	for i := 0; i < j.chunkBuffers; i++ {
-		buffer, err := j.dpConn.RegisterRdmaBuffer(int(j.chunkSize))
-		if err != nil {
-			for _, buffer := range j.readBuffers {
-				_ = buffer.Close()
-			}
-			j.readBuffers = nil
-			j.freeBuffers = nil
-			return err
-		}
-		j.readBuffers = append(j.readBuffers, buffer)
+	for _, buffer := range j.readBuffers {
 		j.freeBuffers <- buffer
 	}
 	return nil

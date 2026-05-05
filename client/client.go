@@ -30,22 +30,6 @@ type readResultEvent struct {
 	err        error
 }
 
-type readyChunkEvent struct {
-	readyChunk *protocol.ChunkBufferReadyFrame
-}
-
-type errorEvent struct {
-	err error
-}
-
-type serverEvent interface {
-	serverEvent()
-}
-
-func (readyChunkEvent) serverEvent() {}
-
-func (errorEvent) serverEvent() {}
-
 type slidingWindow struct {
 	nextAckedChunkID uint64
 	activeReads      int
@@ -130,7 +114,7 @@ type RGetJob struct {
 
 	dpConn rdma.Conn
 
-	serverEventc      chan serverEvent
+	framec            chan protocol.Frame
 	readResultc       chan readResultEvent
 	activeReadWorkers sync.WaitGroup
 	window            *slidingWindow
@@ -257,33 +241,33 @@ func (j *RGetJob) run(ctx context.Context) error {
 	j.ctx, j.cancel = context.WithCancel(ctx)
 	defer j.cancel()
 
-	j.serverEventc = make(chan serverEvent)
+	j.framec = make(chan protocol.Frame)
 	j.readResultc = make(chan readResultEvent, j.chunkBuffers)
 
 	go j.readFrames()
 
-	for j.serverEventc != nil || (j.window != nil && !j.window.doneReading()) {
+	for j.framec != nil || (j.window != nil && !j.window.doneReading()) {
 		select {
 		case <-j.ctx.Done():
 			return j.stop(j.ctx.Err())
-		case event, ok := <-j.serverEventc:
+		case frame, ok := <-j.framec:
 			if !ok {
-				j.serverEventc = nil
+				j.framec = nil
 				continue
 			}
-			switch event := event.(type) {
-			case errorEvent:
-				return j.stop(event.err)
-			case readyChunkEvent:
-				done, err := j.handleServerReadyChunk(event.readyChunk)
+			switch frame := frame.(type) {
+			case *protocol.ChunkBufferReadyFrame:
+				done, err := j.handleReadyChunk(frame)
 				if err != nil {
 					return j.stop(err)
 				}
 				if done {
 					return j.finish()
 				}
+			case *protocol.ErrorFrame:
+				return j.stop(fmt.Errorf("server error [%s]: %s", frame.ErrorKind, frame.Message))
 			default:
-				return j.stop(fmt.Errorf("client: unexpected server event %T", event))
+				return j.stop(fmt.Errorf("client: unexpected frame from server: %s", frame.Kind()))
 			}
 		case result := <-j.readResultc:
 			done, err := j.handleReadResult(result)
@@ -298,14 +282,26 @@ func (j *RGetJob) run(ctx context.Context) error {
 	return nil
 }
 
-func (j *RGetJob) handleServerReadyChunk(readyChunk *protocol.ChunkBufferReadyFrame) (bool, error) {
+func (j *RGetJob) handleReadyChunk(readyChunk *protocol.ChunkBufferReadyFrame) (bool, error) {
 	if readyChunk.Size == 0 && readyChunk.Final {
 		return true, nil
 	}
 	if err := j.initDataPlane(readyChunk); err != nil {
 		return false, err
 	}
-	return false, j.handleReadyChunk(readyChunk)
+	if readyChunk.Size > j.chunkSize {
+		return false, fmt.Errorf("client: chunk size %d exceeds requested chunk buffer %d", readyChunk.Size, j.chunkSize)
+	}
+	buffer, ok := j.window.acquireReadBuffer()
+	if !ok {
+		return false, fmt.Errorf("client: no free RDMA buffer for ready chunk %d", readyChunk.ChunkID)
+	}
+	j.activeReadWorkers.Add(1)
+	go func() {
+		defer j.activeReadWorkers.Done()
+		j.readResultc <- j.readChunk(buffer, readyChunk)
+	}()
+	return false, nil
 }
 
 func (j *RGetJob) initDataPlane(readyChunk *protocol.ChunkBufferReadyFrame) error {
@@ -324,22 +320,6 @@ func (j *RGetJob) initDataPlane(readyChunk *protocol.ChunkBufferReadyFrame) erro
 		return err
 	}
 	j.window = window
-	return nil
-}
-
-func (j *RGetJob) handleReadyChunk(readyChunk *protocol.ChunkBufferReadyFrame) error {
-	if readyChunk.Size > j.chunkSize {
-		return fmt.Errorf("client: chunk size %d exceeds requested chunk buffer %d", readyChunk.Size, j.chunkSize)
-	}
-	buffer, ok := j.window.acquireReadBuffer()
-	if !ok {
-		return fmt.Errorf("client: no free RDMA buffer for ready chunk %d", readyChunk.ChunkID)
-	}
-	j.activeReadWorkers.Add(1)
-	go func() {
-		defer j.activeReadWorkers.Done()
-		j.readResultc <- j.readChunk(buffer, readyChunk)
-	}()
 	return nil
 }
 
@@ -395,43 +375,30 @@ func (j *RGetJob) finish() error {
 }
 
 func (j *RGetJob) readFrames() {
-	defer close(j.serverEventc)
+	defer close(j.framec)
 	for {
 		frame, err := protocol.DecodeFrame(j.ctx, j.ctrl)
 		if err != nil {
-			j.emitErrorEvent(errorEvent{err: err})
+			if !j.emitFrame(&protocol.ErrorFrame{
+				ErrorKind: "decode_frame",
+				Message:   err.Error(),
+			}) {
+				return
+			}
 			return
 		}
-		switch msg := frame.(type) {
-		case *protocol.ChunkBufferReadyFrame:
-			if !j.emitReadyChunkEvent(readyChunkEvent{readyChunk: msg}) {
-				return
-			}
-			if msg.Size == 0 && msg.Final {
-				return
-			}
-		case *protocol.ErrorFrame:
-			j.emitErrorEvent(errorEvent{err: fmt.Errorf("server error [%s]: %s", msg.ErrorKind, msg.Message)})
+		if !j.emitFrame(frame) {
 			return
-		default:
-			j.emitErrorEvent(errorEvent{err: fmt.Errorf("client: unexpected frame from server: %s", frame.Kind())})
+		}
+		if readyChunk, ok := frame.(*protocol.ChunkBufferReadyFrame); ok && readyChunk.Size == 0 && readyChunk.Final {
 			return
 		}
 	}
 }
 
-func (j *RGetJob) emitReadyChunkEvent(event readyChunkEvent) bool {
+func (j *RGetJob) emitFrame(frame protocol.Frame) bool {
 	select {
-	case j.serverEventc <- event:
-		return true
-	case <-j.ctx.Done():
-		return false
-	}
-}
-
-func (j *RGetJob) emitErrorEvent(event errorEvent) bool {
-	select {
-	case j.serverEventc <- event:
+	case j.framec <- frame:
 		return true
 	case <-j.ctx.Done():
 		return false

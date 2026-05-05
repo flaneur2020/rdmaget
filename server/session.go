@@ -268,7 +268,7 @@ func (s *RgetSession) eof() bool {
 	return err == nil && uint64(offset) >= s.totalSize
 }
 
-func (b *chunkBuffer) readyFrame(endpoint rdma.Addr) *protocol.ChunkBufferReadyFrame {
+func (b *chunkBuffer) readyFrame(endpoint rdma.Endpoint) *protocol.ChunkBufferReadyFrame {
 	region := b.remote.Region()
 	region.Length = b.size
 	return &protocol.ChunkBufferReadyFrame{
@@ -300,7 +300,7 @@ func (b *chunkBuffer) Close() error {
 	return err
 }
 
-func emptyChunkReady(endpoint rdma.Addr) *protocol.ChunkBufferReadyFrame {
+func emptyChunkReady(endpoint rdma.Endpoint) *protocol.ChunkBufferReadyFrame {
 	return &protocol.ChunkBufferReadyFrame{
 		BufferIndex:    0,
 		ChunkID:        0,

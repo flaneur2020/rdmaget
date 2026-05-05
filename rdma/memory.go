@@ -16,7 +16,7 @@ var memoryTransport struct {
 // MemoryDevice is an in-memory RdmaDevice implementation for tests and local simulations.
 type MemoryDevice struct {
 	mu             sync.Mutex
-	endpoint       Addr
+	endpoint       Endpoint
 	connected      bool
 	activeReads    atomic.Int64
 	maxActiveReads atomic.Int64
@@ -24,7 +24,7 @@ type MemoryDevice struct {
 
 type memoryConn struct {
 	device *MemoryDevice
-	local  Addr
+	local  Endpoint
 }
 
 type memoryRdmaBuffer struct {
@@ -40,7 +40,7 @@ func NewMemoryDevice() *MemoryDevice {
 	}
 }
 
-func (d *MemoryDevice) Info() Addr {
+func (d *MemoryDevice) Info() Endpoint {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.connected {
@@ -50,7 +50,7 @@ func (d *MemoryDevice) Info() Addr {
 	return d.endpoint
 }
 
-func (d *MemoryDevice) Connect(ctx context.Context, remote Addr) (Conn, error) {
+func (d *MemoryDevice) Connect(ctx context.Context, remote Endpoint) (Conn, error) {
 	d.mu.Lock()
 	if d.connected {
 		d.endpoint = newMemoryAddr()
@@ -64,9 +64,9 @@ func (d *MemoryDevice) Connect(ctx context.Context, remote Addr) (Conn, error) {
 	}, ctx.Err()
 }
 
-func newMemoryAddr() Addr {
+func newMemoryAddr() Endpoint {
 	id := memoryTransport.nextID.Add(1)
-	return Addr{
+	return Endpoint{
 		Device: "memory",
 		Port:   1,
 		LID:    uint16(id),
@@ -84,7 +84,7 @@ func (d *MemoryDevice) MaxActiveReads() int64 {
 	return d.maxActiveReads.Load()
 }
 
-func (c *memoryConn) LocalEndpoint() Addr {
+func (c *memoryConn) LocalEndpoint() Endpoint {
 	return c.local
 }
 

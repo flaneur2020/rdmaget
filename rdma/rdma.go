@@ -9,12 +9,12 @@ import (
 
 var ErrUnsupported = errors.New("rdma: unsupported; rebuild on Linux with -tags rdma and libibverbs")
 
-type Addr = protocol.RDMAEndpoint
+type Endpoint = protocol.RDMAEndpoint
 type MemoryRegion = protocol.RDMAMemoryRegion
 
 type RdmaDevice interface {
-	Info() Addr
-	Connect(ctx context.Context, remote Addr) (Conn, error)
+	Info() Endpoint
+	Connect(ctx context.Context, remote Endpoint) (Conn, error)
 	Close() error
 }
 
@@ -25,7 +25,7 @@ type RdmaBuffer interface {
 }
 
 type Conn interface {
-	LocalEndpoint() Addr
+	LocalEndpoint() Endpoint
 	RegisterRdmaBuffer(size int) (RdmaBuffer, error)
 	Read(ctx context.Context, dst RdmaBuffer, remote MemoryRegion) error
 	Close() error

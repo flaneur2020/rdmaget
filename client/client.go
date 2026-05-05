@@ -54,7 +54,7 @@ func newSlidingWindow(conn rdma.Conn, chunkSize uint64, chunkBuffers int) (*slid
 	return window, nil
 }
 
-func (w *slidingWindow) addAcked(result readResultEvent) {
+func (w *slidingWindow) trackAcked(result readResultEvent) {
 	w.acked[result.readyChunk.ChunkID] = result
 }
 
@@ -331,11 +331,8 @@ func (j *RGetJob) handleReadResult(result readResultEvent) (bool, error) {
 	if err := j.sendAck(result.readyChunk); err != nil {
 		return false, err
 	}
-	j.window.addAcked(result)
-	return j.writeAcked()
-}
+	j.window.trackAcked(result)
 
-func (j *RGetJob) writeAcked() (bool, error) {
 	for {
 		result, ok := j.window.popAcked()
 		if !ok {
